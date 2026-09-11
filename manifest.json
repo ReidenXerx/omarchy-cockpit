@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "id": "reidenxerx.cockpit",
+  "name": "Cockpit",
+  "version": "1.0.0",
+  "author": "ReidenXerx",
+  "license": "MIT",
+  "description": "One hub for what the machine is doing right now: which AI sessions are working and on what, file transfers with real progress, long-running jobs, dirty repos, pending updates. Extensible with your own providers.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "Cockpit",
+    "description": "At-a-glance status hub: agents, transfers, jobs, git, updates",
+    "category": "System",
+    "aliases": ["cockpit", "status", "hub", "activity", "agents", "transfers", "dashboard"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": { "rowsPerSection": 6, "refreshSec": 3 },
+    "schema": [
+      {
+        "key": "rowsPerSection",
+        "type": "integer",
+        "label": "Rows per section",
+        "min": 3, "max": 20, "step": 1,
+        "defaultValue": 6,
+        "description": "How many rows each section shows before it is collapsed behind a count. Click a heading to see the rest."
+      },
+      {
+        "key": "refreshSec",
+        "type": "integer",
+        "label": "Refresh every (seconds)",
+        "min": 1, "max": 30, "step": 1,
+        "defaultValue": 3,
+        "description": "How often the hub re-runs its providers while it is open. Each provider also declares its own cadence, so an expensive one is not re-run just because this ticked."
+      }
+    ]
+  }
+}

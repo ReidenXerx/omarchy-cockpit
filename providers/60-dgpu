@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""Discrete GPU power state, without waking it.
+
+Everything here is a cached sysfs attribute. lspci, nvidia-smi and current_link_speed all
+read PCI config space or talk to the driver, and the kernel resumes a suspended card to
+serve that -- a status widget that used them would wake the very thing it reports on.
+"""
+import json
+import pathlib
+
+NAMES = {"D0": "awake", "D3hot": "sleeping", "D3cold": "deep sleep"}
+
+
+def device():
+    root = pathlib.Path("/sys/bus/pci/drivers/nvidia")
+    for entry in sorted(root.glob("0000:*")):
+        return entry
+    return None
+
+
+def read(path, default=""):
+    try:
+        return path.read_text().strip()
+    except Exception:
+        return default
+
+
+def holders():
+    """Processes with the device open. Only this user's are visible without root, which
+    is worth knowing: nvidia-persistenced runs as its own user and never shows here."""
+    found = []
+    for proc in pathlib.Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            for fd in (proc / "fd").iterdir():
+                if "nvidia" in str(fd.resolve()):
+                    found.append(read(proc / "comm", proc.name))
+                    break
+        except Exception:
+            continue
+    return sorted(set(found))
+
+
+def main():
+    dev = device()
+    rows = []
+    if dev:
+        state = read(dev / "power_state", "?")
+        status = read(dev / "power/runtime_status", "?")
+        awake_ms = int(read(dev / "power/runtime_active_time", "0") or 0)
+        asleep_ms = int(read(dev / "power/runtime_suspended_time", "0") or 0)
+        total = awake_ms + asleep_ms
+        duty = (100.0 * awake_ms / total) if total else 0.0
+
+        who = holders()
+        detail = f"{status} · {duty:.0f}% awake since boot"
+        if state == "D0" and who:
+            detail += " · held by " + ", ".join(who[:3])
+
+        rows.append({
+            "glyph": "\U000f03ae",
+            "title": f"dGPU {NAMES.get(state, state)}",
+            "detail": detail,
+            # An awake card is worth noticing; a sleeping one is the desired state, not news.
+            "state": "busy" if state == "D0" else "idle",
+        })
+
+    print(json.dumps({"section": "GPU", "glyph": "\U000f03ae", "priority": 60,
+                      "intervalSec": 5, "rows": rows}, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

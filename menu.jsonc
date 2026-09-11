@@ -1,0 +1,20 @@
+  "setup.cockpit": {
+    "icon": "󰕮",
+    "label": "Cockpit",
+    "aliases": ["cockpit", "status", "hub", "activity", "dashboard", "agents"]
+  },
+  "setup.cockpit.open": {
+    "icon": "󰕮",
+    "label": "Open the hub",
+    "action": "omarchy-shell shell toggle reidenxerx.cockpit '{}'"
+  },
+  "setup.cockpit.status": {
+    "icon": "󰋽",
+    "label": "Show status in a terminal",
+    "action": "omarchy-launch-floating-terminal-with-presentation @PLUGIN_BIN@/cockpit --plain"
+  },
+  "setup.cockpit.providers": {
+    "icon": "󰅩",
+    "label": "List providers",
+    "action": "omarchy-launch-floating-terminal-with-presentation @PLUGIN_BIN@/cockpit --list"
+  },

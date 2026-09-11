@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""Agent sessions running in terminal windows, and whether each is busy.
+
+Terminal AI agents advertise their state in the window title: a spinner glyph that
+rotates while the agent works and holds still when it is waiting on you. Hyprland already
+knows every window title, so the state of every session on every workspace is readable
+without switching to any of them -- which is the whole point.
+
+Busy-detection is by observation, not by hardcoding one tool's glyph alphabet: the title
+is sampled and compared with the previous sample. A leading glyph that CHANGED means the
+spinner turned, so that session is working. Anything else is waiting. That keeps working
+when a tool changes its spinner, and works for tools whose glyphs nobody enumerated.
+"""
+import json
+import os
+import pathlib
+import subprocess
+import time
+
+STATE = pathlib.Path(os.environ.get("XDG_CACHE_HOME") or pathlib.Path.home() / ".cache") / "omarchy-cockpit"
+SEEN = STATE / "agent-titles.json"
+LIVE = STATE / "agent-state.json"      # written by cockpit-agentd
+
+# How long after the last title change a session still counts as working. The spinner
+# turns a few times a second while busy, so anything under a couple of seconds would
+# flicker; much more and a finished session lingers as "working".
+BUSY_WINDOW = 4.0
+
+# Terminal emulators worth inspecting. Anything else is a normal app, not a session.
+TERMINALS = {"foot", "dev.warp.Warp", "Alacritty", "kitty", "com.mitchellh.ghostty",
+             "org.wezfurlong.wezterm", "xterm-256color", "konsole"}
+
+# A leading non-alphanumeric glyph followed by text is the shape every one of these
+# tools uses. Matching the SHAPE rather than a list of glyphs is what makes this survive
+# a tool changing its spinner.
+def split_glyph(title):
+    t = (title or "").strip()
+    if not t:
+        return "", ""
+    first = t[0]
+    if first.isalnum() or first in "/~.(<[\"'":
+        return "", t
+    return first, t[1:].strip()
+
+
+def hypr(*args):
+    try:
+        r = subprocess.run(["hyprctl", "-j", *args], capture_output=True, text=True, timeout=4)
+        return json.loads(r.stdout) if r.returncode == 0 else []
+    except Exception:
+        return []
+
+
+def load_seen():
+    try:
+        return json.loads(SEEN.read_text())
+    except Exception:
+        return {}
+
+
+def save_seen(data):
+    STATE.mkdir(parents=True, exist_ok=True)
+    tmp = SEEN.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data))
+    tmp.replace(SEEN)
+
+
+def main():
+    clients = hypr("clients")
+    seen = load_seen()
+    try:
+        live = json.loads(LIVE.read_text())
+    except Exception:
+        live = {}   # daemon not running yet: everything reads as waiting, never as an error
+    now = time.time()
+    fresh, rows = {}, []
+
+    for c in clients:
+        if not isinstance(c, dict) or not c.get("mapped"):
+            continue
+        if c.get("class") not in TERMINALS:
+            continue
+        glyph, task = split_glyph(c.get("title", ""))
+        if not glyph and str(c.get("address", "")) not in live:
+            continue  # a plain-titled terminal the daemon has never seen is just a shell
+
+        addr = str(c.get("address", ""))
+        prev = seen.get(addr) or {}
+
+        # Busy comes from the daemon, not from this poll. hyprctl serves a cached title:
+        # sampled ten times in two seconds it returns the identical glyph while the
+        # compositor's event socket is reporting the spinner turning. The daemon holds
+        # that socket open and records when each title actually last changed.
+        watched = live.get(addr) or {}
+        last_change = float(watched.get("changedAt", 0))
+        busy = last_change > 0 and (now - last_change) < BUSY_WINDOW
+        # Prefer the daemon's title: it is the live one.
+        if watched.get("title"):
+            glyph, task = split_glyph(watched["title"])
+
+        fresh[addr] = {"glyph": glyph, "task": task,
+                       "since": prev.get("since", now) if prev.get("task") == task else now}
+
+        ws = c.get("workspace", {}).get("name", "?")
+        # Time since the title last MOVED, from the daemon -- not since the task text
+        # changed. A session can hold one task for hours; what you want to know is when it
+        # last showed a sign of life. Falls back to the task age if the daemon has not
+        # seen this window yet.
+        reference = last_change if last_change > 0 else float(fresh[addr]["since"])
+        age = int(now - reference)
+        elapsed = f"{age//3600}h {age%3600//60}m" if age >= 3600 else (f"{age//60}m" if age >= 60 else f"{age}s")
+        rows.append({
+            "glyph": glyph,
+            "title": task or "(no task)",
+            # "last active" rather than "waiting": the spinner only turns while the agent
+            # is streaming output and goes quiet during a long tool call, so silence is
+            # not proof of idleness and the label should not claim it is.
+            "detail": f"ws{ws} · {c.get('class','')} · "
+                      + ("working" if busy else f"last active {elapsed}"),
+            "state": "busy" if busy else "idle",
+            # Clicking jumps straight to that session, which is the point of not switching.
+            "action": f"hyprctl dispatch focuswindow address:{addr}",
+            "_busy": busy,
+        })
+
+    save_seen(fresh)
+    # Working sessions first: they are the ones whose progress you came to check.
+    rows.sort(key=lambda r: (not r["_busy"], r["title"]))
+    for r in rows:
+        r.pop("_busy", None)
+
+    print(json.dumps({
+        "section": "Agents", "glyph": "󰚩", "priority": 10, "intervalSec": 2, "rows": rows
+    }, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

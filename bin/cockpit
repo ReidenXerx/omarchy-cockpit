@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""Cockpit — run the status providers and print one aggregated document.
+
+  cockpit                 run every provider, print the merged JSON
+  cockpit --list          show which providers are found and their cadence
+  cockpit --only <name>   run one provider, unfiltered, for debugging
+  cockpit --plain         human-readable summary instead of JSON
+
+A provider is any executable in one of these directories, run with no arguments:
+
+  <plugin>/providers/                          shipped with the plugin
+  ~/.config/omarchy/cockpit/providers/         yours, and they win on name clash
+
+It prints ONE JSON object on stdout:
+
+  {
+    "section":  "Agents",       # heading in the hub
+    "glyph":    "b",           # heading glyph
+    "priority": 10,             # lower sorts higher; ties break on name
+    "intervalSec": 3,           # how often this is worth re-running
+    "rows": [
+      {
+        "glyph":  "b",         # optional, per row
+        "title":  "crypto-bot",
+        "detail": "3 commits ahead",
+        "state":  "busy",       # ok | busy | warn | idle  -> colour only
+        "progress": 42,         # optional 0-100, draws a bar
+        "action": "hyprctl dispatch focuswindow address:0x..."   # optional, on click
+      }
+    ]
+  }
+
+Anything else on stdout, a non-zero exit, or a timeout means the provider is skipped --
+one broken provider must never take the hub down with it. Write to stderr to say why.
+"""
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import time
+
+PLUGIN_DIR = pathlib.Path(__file__).resolve().parent.parent
+BUILTIN = PLUGIN_DIR / "providers"
+USER = pathlib.Path.home() / ".config/omarchy/cockpit/providers"
+CACHE = pathlib.Path(os.environ.get("XDG_CACHE_HOME") or pathlib.Path.home() / ".cache") / "omarchy-cockpit"
+TIMEOUT = 6
+
+
+def discover():
+    """User providers shadow built-ins of the same name, so anything shipped can be
+    replaced without editing the plugin."""
+    found = {}
+    for directory in (BUILTIN, USER):
+        if not directory.is_dir():
+            continue
+        for entry in sorted(directory.iterdir()):
+            if entry.is_file() and os.access(entry, os.X_OK) and not entry.name.startswith("."):
+                found[entry.name] = entry
+    return found
+
+
+def cached(name):
+    path = CACHE / (name + ".json")
+    try:
+        raw = json.loads(path.read_text())
+        return raw.get("at", 0), raw.get("doc")
+    except Exception:
+        return 0, None
+
+
+def store(name, doc):
+    CACHE.mkdir(parents=True, exist_ok=True)
+    tmp = CACHE / (name + ".json.tmp")
+    tmp.write_text(json.dumps({"at": time.time(), "doc": doc}))
+    tmp.replace(CACHE / (name + ".json"))
+
+
+def run_one(path, force=False):
+    """Returns (doc, note). A provider that fails yields (None, reason) rather than
+    raising, because the hub is more useful with four sections than with none."""
+    name = path.name
+    at, doc = cached(name)
+    interval = (doc or {}).get("intervalSec", 5) if doc else 0
+    if not force and doc is not None and (time.time() - at) < max(1, float(interval)):
+        return doc, "cached"
+    # A provider may declare its own budget: scanning repos or asking a mirror what is
+    # out of date legitimately takes longer than reading /proc. Taken from the cached
+    # document, since it is the provider itself that says so.
+    budget = float((doc or {}).get("timeoutSec", TIMEOUT))
+    budget = max(1.0, min(90.0, budget))
+    try:
+        r = subprocess.run([str(path)], capture_output=True, text=True, timeout=budget)
+    except subprocess.TimeoutExpired:
+        return doc, f"timed out after {budget:g}s"
+    except Exception as e:
+        return doc, f"failed to start: {e}"
+    if r.returncode != 0:
+        return doc, f"exit {r.returncode}: {r.stderr.strip()[:120]}"
+    out = r.stdout.strip()
+    if not out:
+        return None, "no output"
+    try:
+        parsed = json.loads(out)
+    except Exception:
+        return doc, "output was not JSON"
+    if not isinstance(parsed, dict) or "rows" not in parsed:
+        return doc, "missing rows"
+    parsed.setdefault("section", name)
+    parsed.setdefault("priority", 50)
+    parsed.setdefault("intervalSec", 5)
+    parsed.setdefault("timeoutSec", TIMEOUT)
+    parsed["rows"] = [r for r in parsed.get("rows", []) if isinstance(r, dict)]
+    store(name, parsed)
+    return parsed, "ok"
+
+
+def collect(force=False, only=None):
+    sections, notes = [], {}
+    for name, path in discover().items():
+        if only and only not in name:
+            continue
+        doc, note = run_one(path, force=force)
+        notes[name] = note
+        if doc and doc.get("rows"):
+            sections.append(doc)
+    sections.sort(key=lambda s: (s.get("priority", 50), s.get("section", "")))
+    return sections, notes
+
+
+def main(argv):
+    if "--list" in argv:
+        for name, path in discover().items():
+            origin = "user" if str(path).startswith(str(USER)) else "built-in"
+            print(f"  {name:16} {origin:9} {path}")
+        return 0
+
+    only = None
+    if "--only" in argv:
+        i = argv.index("--only")
+        if i + 1 < len(argv):
+            only = argv[i + 1]
+
+    sections, notes = collect(force="--force" in argv or only is not None, only=only)
+
+    if "--plain" in argv:
+        for s in sections:
+            print(f"{s.get('glyph','')} {s['section']}")
+            for row in s["rows"]:
+                bar = f" [{row['progress']:>3}%]" if isinstance(row.get("progress"), (int, float)) else ""
+                print(f"    {row.get('glyph','')} {row.get('title','')}{bar}  {row.get('detail','')}")
+        broken = {k: v for k, v in notes.items() if v not in ("ok", "cached")}
+        for k, v in broken.items():
+            print(f"  ! {k}: {v}", file=sys.stderr)
+        return 0
+
+    print(json.dumps({"sections": sections, "notes": notes}, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

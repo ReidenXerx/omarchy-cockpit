@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""Whether a reboot is owed, and why.
+
+On Arch the running kernel and the installed one drift apart silently after an update,
+and nothing in the desktop says so. It matters more than usual with an out-of-tree
+graphics driver: the module has to match the running kernel, so the gap between "updated"
+and "rebooted" is the window where things break in confusing ways.
+
+Silent when there is nothing to report, which is most of the time.
+"""
+import json
+import os
+import pathlib
+import subprocess
+
+# Packages whose update is only actually in effect after a reboot.
+CRITICAL = ("linux", "linux-lts", "linux-zen", "nvidia", "nvidia-open", "nvidia-dkms",
+            "systemd", "intel-ucode", "amd-ucode", "mesa")
+
+
+def pacman_version(pkg):
+    try:
+        r = subprocess.run(["pacman", "-Q", pkg], capture_output=True, text=True, timeout=4)
+        return r.stdout.split()[1] if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def normalise(v):
+    """pacman writes 7.2.4.arch1-2 where uname reports 7.2.4-arch1-2. Compare on digits
+    and letters alone so the two spellings of the same version match."""
+    return "".join(ch for ch in v if ch.isalnum())
+
+
+def boot_time():
+    try:
+        with open("/proc/uptime") as f:
+            return float(f.read().split()[0])
+    except Exception:
+        return 0.0
+
+
+def main():
+    import time
+    running = os.uname().release
+    installed = pacman_version("linux")
+    up = boot_time()
+
+    kernel_stale = bool(installed) and normalise(installed) not in normalise(running)
+
+    stale_pkgs = []
+    for pkg in CRITICAL:
+        if pkg == "linux":
+            continue
+        try:
+            newest = max((d.stat().st_mtime for d in
+                          pathlib.Path("/var/lib/pacman/local").glob(f"{pkg}-*") if d.is_dir()),
+                         default=0)
+        except Exception:
+            newest = 0
+        if newest and (time.time() - newest) < up:
+            stale_pkgs.append(pkg)
+
+    rows = []
+    if kernel_stale or stale_pkgs:
+        # One row, not one per package: these are all the same fact -- a reboot is owed --
+        # and listing them separately makes a single condition look like three problems.
+        what = []
+        if kernel_stale:
+            what.append(f"kernel {installed}")
+        what.extend(stale_pkgs)
+        rows.append({
+            "glyph": "󰜉",
+            "title": "Reboot pending",
+            "detail": (f"running {running} · updated since boot: " + ", ".join(what))
+                      if what else "updates applied since boot",
+            "state": "warn",
+        })
+
+    print(json.dumps({"section": "Reboot", "glyph": "󰜉", "priority": 5,
+                      "intervalSec": 300, "rows": rows}, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

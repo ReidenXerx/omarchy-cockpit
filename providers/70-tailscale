@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+"""Which of your machines are reachable, and how.
+
+Only peers that are actually up are listed. A tailnet is mostly idle machines, and a row
+per sleeping laptop is the kind of always-true noise that makes a hub stop being read.
+"""
+import json
+import shutil
+import subprocess
+
+OS_GLYPH = {"windows": "\U000f05b3", "linux": "\U000f033d", "android": "\U000f0032",
+            "macOS": "\U000f0035", "iOS": "\U000f0035"}
+
+
+def main():
+    rows = []
+    if shutil.which("tailscale"):
+        try:
+            r = subprocess.run(["tailscale", "status", "--json"],
+                               capture_output=True, text=True, timeout=6)
+            data = json.loads(r.stdout) if r.returncode == 0 else {}
+        except Exception:
+            data = {}
+
+        if data.get("BackendState") not in (None, "Running"):
+            rows.append({"glyph": "\U000f0a49", "title": "Tailscale " + str(data.get("BackendState")),
+                         "detail": "not connected", "state": "warn",
+                         "action": "tailscale up"})
+        else:
+            for peer in (data.get("Peer") or {}).values():
+                if not peer.get("Online"):
+                    continue
+                name = str(peer.get("HostName", "?"))
+                os_name = str(peer.get("OS", ""))
+                # Direct means a peer-to-peer path; a relayed link is slower and worth
+                # distinguishing when you are about to stream a desktop over it.
+                relay = peer.get("Relay") or ""
+                path = "direct" if peer.get("CurAddr") else (f"relay {relay}" if relay else "idle")
+                rx, tx = int(peer.get("RxBytes", 0)), int(peer.get("TxBytes", 0))
+                traffic = ""
+                if rx or tx:
+                    total = (rx + tx) / (1024 * 1024)
+                    traffic = f" · {total:.0f}MB" if total >= 1 else ""
+                rows.append({
+                    "glyph": OS_GLYPH.get(os_name, "\U000f033d"),
+                    "title": name,
+                    "detail": f"{os_name} · {path}{traffic}",
+                    "state": "busy" if peer.get("CurAddr") else "idle",
+                    "action": f"ping -c1 {peer.get('TailscaleIPs', ['?'])[0]}" if peer.get("TailscaleIPs") else "",
+                })
+    rows.sort(key=lambda r: (r["state"] != "busy", r["title"]))
+    print(json.dumps({"section": "Tailnet", "glyph": "\U000f0a49", "priority": 70,
+                      "intervalSec": 20, "rows": rows}, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

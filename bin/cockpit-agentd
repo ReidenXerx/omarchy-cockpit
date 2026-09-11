@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""Watch Hyprland window titles and record when each last changed.
+
+Why a daemon rather than polling: `hyprctl clients` serves a cached title. Sampled ten
+times over two seconds it returns the identical glyph while the compositor's own event
+socket is reporting the spinner turning. So the only accurate source for "is this session
+working right now" is the event stream, and something has to hold that socket open.
+
+Writes ~/.cache/omarchy-cockpit/agent-state.json:
+  { "0x55...": {"title": "...", "changedAt": 1788..., "changes": 12} }
+
+Idempotent: a second instance exits rather than competing for the socket.
+"""
+import json
+import os
+import pathlib
+import socket
+import sys
+import time
+
+CACHE = pathlib.Path(os.environ.get("XDG_CACHE_HOME") or pathlib.Path.home() / ".cache") / "omarchy-cockpit"
+STATE = CACHE / "agent-state.json"
+LOCK = CACHE / "agentd.pid"
+FLUSH_EVERY = 0.5
+
+
+def socket_path():
+    runtime = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    if not sig:
+        base = pathlib.Path(runtime) / "hypr"
+        entries = sorted(base.glob("*/.socket2.sock"), key=lambda p: p.stat().st_mtime, reverse=True)
+        return str(entries[0]) if entries else ""
+    return f"{runtime}/hypr/{sig}/.socket2.sock"
+
+
+def already_running():
+    try:
+        pid = int(LOCK.read_text().strip())
+    except Exception:
+        return False
+    if pid == os.getpid():
+        return False
+    # A stale pid file outlives a crash; treat "no such process" as free.
+    return pathlib.Path(f"/proc/{pid}").is_dir()
+
+
+def main():
+    CACHE.mkdir(parents=True, exist_ok=True)
+    if already_running():
+        print("cockpit-agentd: already running", file=sys.stderr)
+        return 0
+    LOCK.write_text(str(os.getpid()))
+
+    path = socket_path()
+    if not path or not pathlib.Path(path).exists():
+        print(f"cockpit-agentd: no Hyprland event socket at {path!r}", file=sys.stderr)
+        return 1
+
+    state = {}
+    try:
+        state = json.loads(STATE.read_text())
+    except Exception:
+        state = {}
+
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(path)
+    buf = b""
+    dirty = False
+    last_flush = time.time()
+
+    def flush():
+        tmp = STATE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(state))
+        tmp.replace(STATE)
+
+    while True:
+        chunk = sock.recv(8192)
+        if not chunk:
+            break
+        buf += chunk
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            text = line.decode("utf-8", "replace")
+            # windowtitlev2 carries the address, which windowtitle does not, and the
+            # address is the only stable way to tie a title to a window.
+            if not text.startswith("windowtitlev2>>"):
+                if text.startswith("closewindow>>"):
+                    state.pop("0x" + text.split(">>", 1)[1].strip().lstrip("0x"), None)
+                    dirty = True
+                continue
+            payload = text.split(">>", 1)[1]
+            addr, _, title = payload.partition(",")
+            addr = "0x" + addr.strip().removeprefix("0x")
+            prev = state.get(addr, {})
+            if prev.get("title") != title:
+                state[addr] = {"title": title, "changedAt": time.time(),
+                               "changes": int(prev.get("changes", 0)) + 1}
+                dirty = True
+        # Batched: a spinner can fire several times a second and this file is read by a
+        # provider on a timer, not on every event.
+        if dirty and (time.time() - last_flush) >= FLUSH_EVERY:
+            flush()
+            dirty = False
+            last_flush = time.time()
+
+    if dirty:
+        flush()
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(0)
