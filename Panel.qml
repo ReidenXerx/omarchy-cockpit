@@ -27,6 +27,7 @@ Panel {
   property var expanded: ({})
   readonly property var display: Model.flatten(sections, rowsPerSection, expanded)
   readonly property int liveCount: Model.liveCount(sections)
+  readonly property int needsCount: Model.needsCount(sections)
   readonly property string summaryText: Model.summary(sections)
 
   // ---------------------------------------------------------------- data
@@ -100,10 +101,11 @@ Panel {
   }
 
   Timer {
-    // Keeps the bar count honest while closed, cheaply -- providers cache themselves, so
-    // this mostly reads their cache rather than re-running anything.
+    // Keeps the bar dot honest while closed, cheaply -- providers cache themselves, so
+    // this mostly reads their cache rather than re-running anything. Five seconds because
+    // the dot turns urgent when an agent is waiting on you, and that is worth seeing soon.
     running: !root.opened
-    interval: 15000
+    interval: 5000
     repeat: true
     triggeredOnStart: true
     onTriggered: root.refresh()
@@ -248,8 +250,10 @@ Panel {
 
                 Text {
                   text: line.modelData.glyph || ""
+                  // "needs" (an agent waiting on you) and "warn" (true all day) share the
+                  // urgent tint; only "needs" also colours its detail line and the bar dot.
                   color: line.modelData.state === "busy" ? Color.accent
-                       : (line.modelData.state === "warn" ? Color.urgent : root.barForeground)
+                       : ((line.modelData.state === "warn" || line.modelData.state === "needs") ? Color.urgent : root.barForeground)
                   opacity: line.modelData.state === "idle" ? 0.55 : 1.0
                   font.pixelSize: Style.font.body
                   Layout.preferredWidth: Style.space(16)
@@ -291,8 +295,8 @@ Panel {
                     Text {
                       Layout.fillWidth: true
                       text: line.modelData.detail || ""
-                      color: root.barForeground
-                      opacity: 0.5
+                      color: line.modelData.state === "needs" ? Color.urgent : root.barForeground
+                      opacity: line.modelData.state === "needs" ? 0.9 : 0.5
                       font.pixelSize: Style.font.caption
                       elide: Text.ElideRight
                     }

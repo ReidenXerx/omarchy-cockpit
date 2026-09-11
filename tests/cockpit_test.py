@@ -571,6 +571,165 @@ class Daemon(Sandbox):
         self.assertEqual(state["0xabc"]["changes"], 2)
 
 
+# ------------------------------------------------------------------ agents
+
+class Agents(Sandbox):
+    """10-agents against real processes: a sleeping child stands in for a Claude Code
+    session, and its pid or this test process's pid for the window that holds it."""
+
+    def setUp(self):
+        super().setUp()
+        self.agents = load(ROOT / "providers" / "10-agents", "provider_agents")
+        self.sessions = self.root / "claude-sessions"
+        self.sessions.mkdir(mode=0o700)
+        mock.patch.object(self.agents, "CLAUDE_SESSIONS", self.sessions).start()
+        mock.patch.object(self.agents, "SEEN", self.root / "agent-titles.json").start()
+        mock.patch.object(self.agents, "LIVE", self.root / "agent-state.json").start()
+        self.clients = []
+        mock.patch.object(common, "hypr_clients", lambda: self.clients).start()
+        self.sleeper = self.spawn()
+
+    def spawn(self):
+        proc = subprocess.Popen(["/usr/bin/sleep", "60"])
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        return proc
+
+    @staticmethod
+    def start_time(pid):
+        content = pathlib.Path(f"/proc/{pid}/stat").read_text()
+        return content[content.rfind(")") + 2:].split()[19]
+
+    def session(self, pid=None, age=125, **fields):
+        pid = pid or self.sleeper.pid
+        doc = {"pid": pid, "procStart": self.start_time(pid), "sessionId": "abc", "cwd": "/home/x/project",
+               "kind": "interactive", "name": "demo-session", "status": "busy",
+               "statusUpdatedAt": int((time.time() - age) * 1000), "peerFeatures": ["notify_idle"]}
+        doc.update(fields)
+        path = self.sessions / f"{pid}.json"
+        path.write_text(json.dumps(doc))
+        return path
+
+    def window(self, address="0x55aa", pid=None, title="◐ Fix the flaky test", cls="foot", ws="3"):
+        self.clients.append({"mapped": True, "address": address, "pid": os.getpid() if pid is None else pid,
+                             "class": cls, "title": title, "workspace": {"id": 3, "name": ws}})
+
+    def rows(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.agents.main()
+        return json.loads(out.getvalue())["rows"]
+
+    def test_a_working_session_is_found_through_its_parent_window(self):
+        self.session(status="busy")
+        self.window()   # owned by this process, the sleeper's parent
+        self.assertEqual(self.rows(), [{
+            "glyph": "◐", "title": "Fix the flaky test", "detail": "working for 2m · ws3 · Claude",
+            "state": "busy", "action": {"kind": "focus-window", "address": "0x55aa"}}])
+
+    def test_a_session_waiting_for_you_says_why_and_comes_first(self):
+        other = self.spawn()
+        self.session(status="busy")
+        self.session(pid=other.pid, status="waiting", waitingFor="input needed")
+        self.window("0x55aa", pid=self.sleeper.pid, title="◐ Zzz busy one", ws="2")
+        self.window("0x66bb", pid=other.pid, title="✳ Asks a question", ws="5")
+        rows = self.rows()
+        self.assertEqual([(r["state"], r["detail"]) for r in rows],
+                         [("needs", "needs you: question · ws5 · Claude"), ("busy", "working for 2m · ws2 · Claude")])
+        self.assertEqual(rows[0]["action"], {"kind": "focus-window", "address": "0x66bb"})
+
+    def test_the_needs_text_is_preferred_and_unknown_reasons_are_shown_as_written(self):
+        self.session(status="waiting", waitingFor="dialog open", needs="choose: allow or deny the edit")
+        self.assertEqual(self.rows()[0]["detail"], "needs you: choose: allow or deny the edit · no window · Claude")
+        self.session(status="waiting", waitingFor="something new")
+        self.assertEqual(self.rows()[0]["detail"], "needs you: something new · no window · Claude")
+        self.session(status="waiting")
+        self.assertEqual(self.rows()[0]["detail"], "needs you · no window · Claude")
+
+    def test_an_idle_session_says_for_how_long(self):
+        self.session(status="idle", age=301)
+        self.window()
+        row = self.rows()[0]
+        self.assertEqual((row["glyph"], row["state"], row["detail"]), ("✳", "idle", "idle for 5m · ws3 · Claude"))
+
+    def test_a_session_without_a_window_still_shows_without_an_action(self):
+        self.session(status="busy", age=10)
+        self.window(pid=1_999_999_999, title="◐ Someone else")   # a window, but not this session's
+        rows = [r for r in self.rows() if r["detail"].endswith("Claude")]
+        self.assertEqual(rows, [{"glyph": "◐", "title": "demo-session",
+                                 "detail": "working for 10s · no window · Claude", "state": "busy"}])
+        self.session(status="busy", kind="background")
+        self.assertIn("· background ·", self.rows()[0]["detail"])
+
+    def test_stale_foreign_or_malformed_records_are_not_sessions(self):
+        done = subprocess.Popen(["/usr/bin/true"])
+        done.wait()
+        cases = {
+            "wrong start time": lambda: self.session(procStart="1"),
+            "pid does not match the file name": lambda: (self.sessions / "12345.json").write_text(
+                json.dumps({"pid": self.sleeper.pid, "procStart": self.start_time(self.sleeper.pid), "status": "busy"})),
+            "exited process": lambda: (self.sessions / f"{done.pid}.json").write_text(
+                json.dumps({"pid": done.pid, "procStart": "1", "status": "busy"})),
+            "unknown status": lambda: self.session(status="sleeping"),
+            "boolean pid": lambda: (self.sessions / "1.json").write_text(json.dumps({"pid": True, "procStart": "1", "status": "busy"})),
+            "malformed": lambda: (self.sessions / f"{self.sleeper.pid}.json").write_text("{nope"),
+            "oversized": lambda: self.session(pad="x" * self.agents.SESSION_FILE_MAX),
+            "deep": lambda: self.session(pad=[[[[["x"]]]]]),
+            "not a session file name": lambda: (self.sessions / "notes.json").write_text(json.dumps({"status": "busy"})),
+        }
+        for label, make in cases.items():
+            for path in self.sessions.iterdir():
+                path.unlink()
+            make()
+            self.assertEqual(self.rows(), [], label)
+
+    def test_a_symlinked_record_is_not_followed(self):
+        real = self.session(status="waiting")
+        target = self.root / "elsewhere.json"
+        real.rename(target)
+        (self.sessions / real.name).symlink_to(target)
+        self.assertEqual(self.rows(), [])
+
+    def test_one_terminal_process_with_several_windows_is_told_apart_by_title(self):
+        self.session(status="busy")
+        self.window("0x10", title="zsh: ~/src")
+        self.window("0x20", title="✳ The Claude one")
+        rows = self.rows()
+        self.assertEqual([(r["title"], r.get("action")) for r in rows],
+                         [("The Claude one", {"kind": "focus-window", "address": "0x20"})])
+        self.window("0x30", title="◐ Another Claude")   # now two candidates: no guessing
+        rows = [r for r in self.rows() if r["detail"].endswith("Claude")]
+        self.assertEqual(len(rows), 1)
+        self.assertNotIn("action", rows[0])
+
+    def test_other_agents_keep_title_detection_and_claude_windows_are_not_listed_twice(self):
+        self.session(status="waiting", waitingFor="input needed")
+        self.window("0x55aa", pid=self.sleeper.pid, title="✳ Claude task")
+        self.window("0x77cc", pid=1_999_999_998, title="⠋ codex refactor", cls="kitty", ws="4")
+        (self.root / "agent-state.json").write_text(json.dumps({
+            "0x55aa": {"title": "✳ Claude task", "changedAt": time.time() - 900, "changes": 3},
+            "0x77cc": {"title": "⠙ codex refactor", "changedAt": time.time(), "changes": 9}}))
+        rows = self.rows()
+        self.assertEqual([(r["title"], r["state"], r["detail"]) for r in rows],
+                         [("Claude task", "needs", "needs you: question · ws3 · Claude"),
+                          ("codex refactor", "busy", "ws4 · kitty · working")])
+
+    def test_display_text_from_records_and_titles_is_cleaned(self):
+        self.session(status="waiting", name="evil\x1b]0;pwned\x07", needs="line\nbreak\x9b")
+        self.window(pid=self.sleeper.pid, title="plain title")
+        row = self.rows()[0]
+        self.assertEqual(row["title"], "evil�]0;pwned�")
+        self.assertEqual(row["detail"], "needs you: line�break� · ws3 · Claude")
+
+    def test_hostile_client_fields_do_not_break_the_provider(self):
+        self.session(status="busy")
+        self.clients.extend([None, "x", {"mapped": True, "address": "0x1", "pid": True, "class": ["foot"], "title": 5},
+                             {"mapped": True, "address": "nothex", "pid": os.getpid()},
+                             {"mapped": False, "address": "0x2", "pid": os.getpid()}])
+        rows = self.rows()
+        self.assertEqual([r["detail"] for r in rows], ["working for 2m · no window · Claude"])
+
+
 # ------------------------------------------------------------------ providers
 
 class Providers(Sandbox):

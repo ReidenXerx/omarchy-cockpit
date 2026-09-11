@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "reidenxerx.cockpit",
   "name": "Cockpit",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": "ReidenXerx",
   "license": "MIT",
-  "description": "One hub for what the machine is doing right now: which AI sessions are working and on what, file transfers with real progress, long-running jobs, dirty repos, pending updates. Extensible with your own providers.",
+  "description": "One hub for what the machine is doing right now: which AI sessions are working, waiting for you or idle, file transfers with real progress, long-running jobs, dirty repos, pending updates. Extensible with your own providers.",
   "kinds": ["bar-widget"],
   "entryPoints": { "barWidget": "BarWidget.qml" },
   "barWidget": {

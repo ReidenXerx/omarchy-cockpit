@@ -23,6 +23,7 @@ BarWidget {
   function closeForPopoutSwitch() { if (panelLoader.item) panelLoader.item.closeForPopoutSwitch() }
 
   readonly property int liveCount: panelLoader.item ? panelLoader.item.liveCount : 0
+  readonly property int needsCount: panelLoader.item ? panelLoader.item.needsCount : 0
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -62,12 +63,14 @@ BarWidget {
     // A dot rather than a number, the way the bell marks unread. It sits on top of the
     // button instead of inside its text, so the slot's optical centring is untouched and
     // the spacing stays even with every other icon in the bar.
+    // Urgent while an agent is waiting on you -- a question or a permission prompt -- since
+    // that is the one thing here that stalls until you act.
     Rectangle {
-      visible: root.liveCount > 0
+      visible: root.liveCount > 0 || root.needsCount > 0
       width: Style.space(6)
       height: width
       radius: width / 2
-      color: Color.accent
+      color: root.needsCount > 0 ? Color.urgent : Color.accent
       anchors.right: parent.right
       anchors.top: parent.top
       anchors.rightMargin: Style.space(3)

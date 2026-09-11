@@ -8,7 +8,7 @@ const assert = require("assert")
 const source = fs.readFileSync(path.join(__dirname, "..", "CockpitModel.js"), "utf8")
   .replace(/^\.pragma library\s*$/m, "")
 const M = new Function(source +
-  "\nreturn { parse, flatten, liveCount, summary, brokenNotes, terminalLaunch, actionJson }")()
+  "\nreturn { parse, flatten, liveCount, needsCount, summary, brokenNotes, terminalLaunch, actionJson }")()
 
 const LAUNCHER = "/usr/bin/omarchy-launch-floating-terminal-with-presentation"
 let failures = 0
@@ -62,13 +62,30 @@ test("flatten keeps structured actions and drops shell strings", () => {
   assert.strictEqual(M.actionJson({ kind: "run", argv: ["x".repeat(9000)] }), "")
 })
 
-test("liveCount, summary and brokenNotes", () => {
+test("flatten passes the needs state through", () => {
+  const out = M.flatten([{ section: "Agents", rows: [{ title: "a", state: "needs" }] }], 6, {})
+  assert.strictEqual(out[1].state, "needs")
+})
+
+test("liveCount, needsCount, summary and brokenNotes", () => {
   const sections = [{ section: "Agents", rows: [{ state: "busy" }, { state: "idle" }, null] },
                     { section: "Git", rows: [{ state: "warn" }] }]
   assert.strictEqual(M.liveCount(sections), 1)
+  assert.strictEqual(M.needsCount(sections), 0)
   assert.strictEqual(M.summary(sections), "3 agents · 1 git")
   assert.strictEqual(M.summary([]), "Nothing in flight")
   assert.deepStrictEqual(M.brokenNotes({ a: "ok", b: "cached", c: "timed out after 6s" }), ["c: timed out after 6s"])
+})
+
+test("an agent waiting for you is counted apart from work in motion and leads the summary", () => {
+  const one = [{ section: "Agents", rows: [{ state: "needs" }, { state: "busy" }] },
+               { section: "Git", rows: [{ state: "warn" }] }]
+  assert.strictEqual(M.liveCount(one), 1)
+  assert.strictEqual(M.needsCount(one), 1)
+  assert.strictEqual(M.summary(one), "1 needs you · 2 agents · 1 git")
+  const two = [{ section: "Agents", rows: [{ state: "needs" }, { state: "needs" }, "junk", { state: "NEEDS" }] }]
+  assert.strictEqual(M.needsCount(two), 2)
+  assert.strictEqual(M.summary(two), "2 need you · 4 agents")
 })
 
 test("terminalLaunch accepts only the wrapper with one command string", () => {

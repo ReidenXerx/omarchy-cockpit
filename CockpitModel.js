@@ -97,8 +97,24 @@ function liveCount(sections) {
   return n
 }
 
+// Rows that need you now: an agent asking a question or holding a permission prompt. Unlike
+// "warn", which marks things that are true all day, this is short-lived and urgent, so it
+// is what turns the bar dot urgent and leads the tooltip.
+function needsCount(sections) {
+  var n = 0
+  for (var i = 0; i < sections.length; i++) {
+    var rows = rowsOf(sections[i])
+    for (var j = 0; j < rows.length; j++) {
+      if (isObject(rows[j]) && rows[j].state === "needs") n++
+    }
+  }
+  return n
+}
+
 function summary(sections) {
   var parts = []
+  var needs = needsCount(sections)
+  if (needs) parts.push(needs + (needs === 1 ? " needs you" : " need you"))
   for (var i = 0; i < sections.length; i++) {
     var rows = rowsOf(sections[i])
     if (rows.length) parts.push(rows.length + " " + text(sections[i].section, 64).toLowerCase())
