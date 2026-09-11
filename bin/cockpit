@@ -1,138 +1,370 @@
-#!/usr/bin/env python3
-"""Cockpit — run the status providers and print one aggregated document.
+#!/usr/bin/python3
+"""Cockpit -- run the status providers and print one aggregated document.
 
   cockpit                 run every provider, print the merged JSON
-  cockpit --list          show which providers are found and their cadence
-  cockpit --only <name>   run one provider, unfiltered, for debugging
+  cockpit --list          show which providers are found, where from, and any problem
+  cockpit --only <name>   run the providers whose name contains <name>, uncached
   cockpit --plain         human-readable summary instead of JSON
+  cockpit --force         ignore the per-provider caches
+  cockpit action          read one row action (JSON, one line) from stdin and perform it
 
-A provider is any executable in one of these directories, run with no arguments:
+Providers:
 
-  <plugin>/providers/                          shipped with the plugin
-  ~/.config/omarchy/cockpit/providers/         yours, and they win on name clash
+  <plugin>/providers/                      shipped; run as /usr/bin/python3 <file>
+  ~/.config/omarchy/cockpit/providers/     yours; they win on a name clash
+
+A user provider must be a regular file you own, executable, not group/other-writable and
+reached without symlinks, named with letters, digits, "." "_" "-". Anything else is
+skipped with a visible note -- including when it shadows a built-in, so a replacement
+that is not running never goes unnoticed.
 
 It prints ONE JSON object on stdout:
 
   {
     "section":  "Agents",       # heading in the hub
-    "glyph":    "b",           # heading glyph
+    "glyph":    "󰚩",            # heading glyph
     "priority": 10,             # lower sorts higher; ties break on name
     "intervalSec": 3,           # how often this is worth re-running
+    "timeoutSec": 6,            # its own time budget, 1..30 seconds
     "rows": [
       {
-        "glyph":  "b",         # optional, per row
+        "glyph":  "󰚩",          # optional, per row
         "title":  "crypto-bot",
         "detail": "3 commits ahead",
         "state":  "busy",       # ok | busy | warn | idle  -> colour only
         "progress": 42,         # optional 0-100, draws a bar
-        "action": "hyprctl dispatch focuswindow address:0x..."   # optional, on click
+        "action": {"kind": "focus-window", "address": "0x55d0c0ffee"}   # optional
       }
     ]
   }
 
-Anything else on stdout, a non-zero exit, or a timeout means the provider is skipped --
-one broken provider must never take the hub down with it. Write to stderr to say why.
+Actions are structured, never shell commands -- see cockpit_common.validate_action for
+the three kinds and the programs they may run.
+
+Limits: 256 KB of output, 200 rows, 1 KB per string, 30 s. Anything else on stdout, a
+non-zero exit, a timeout or an overrun means the provider is skipped (its last good
+document is kept) -- one broken provider must never take the hub down. Write to stderr to
+say why.
 """
+import collections
+import concurrent.futures
 import json
-import os
 import pathlib
-import subprocess
+import re
+import shlex
+import stat
 import sys
 import time
 
-PLUGIN_DIR = pathlib.Path(__file__).resolve().parent.parent
-BUILTIN = PLUGIN_DIR / "providers"
-USER = pathlib.Path.home() / ".config/omarchy/cockpit/providers"
-CACHE = pathlib.Path(os.environ.get("XDG_CACHE_HOME") or pathlib.Path.home() / ".cache") / "omarchy-cockpit"
-TIMEOUT = 6
+BIN = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(BIN))
+import plugin_safety as safe  # noqa: E402
+import cockpit_common as common  # noqa: E402
 
+PLUGIN_DIR = BIN.parent
+BUILTIN_DIR = PLUGIN_DIR / "providers"
+# Shipped providers, and the budget each gets before it has declared its own.
+BUILTIN_PROVIDERS = {"05-reboot": 6, "10-agents": 6, "20-transfers": 6, "30-jobs": 6,
+                     "40-git": 20, "50-updates": 30, "60-dgpu": 6, "70-tailscale": 10,
+                     "80-disk": 10}
+USER_DIR = pathlib.Path(common.HOME) / ".config/omarchy/cockpit/providers"
+CACHE = common.state_dir() / "providers"
+PYTHON = "/usr/bin/python3"
+TERMINAL = "omarchy-launch-floating-terminal-with-presentation"
+
+TIMEOUT_DEFAULT = 6
+TIMEOUT_MIN, TIMEOUT_MAX = 1, 30
+OUTPUT_MAX = 256 * 1024
+ROWS_MAX = 200
+STRING_MAX = 1024
+USER_PROVIDERS_MAX = 16
+USER_DIR_ENTRIES_MAX = 256
+CACHE_MAX = 1024 * 1024
+HUB_OUTPUT_MAX = 2 * 1024 * 1024
+STATES = ("ok", "busy", "warn", "idle")
+NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+
+Provider = collections.namedtuple("Provider", "name argv origin path problem")
+
+
+# ------------------------------------------------------------------ discovery
 
 def discover():
-    """User providers shadow built-ins of the same name, so anything shipped can be
-    replaced without editing the plugin."""
+    """{name: Provider}, built-ins first. A user file shadows the built-in of the same
+    name, so anything shipped can be replaced without editing the plugin."""
     found = {}
-    for directory in (BUILTIN, USER):
-        if not directory.is_dir():
+    for name in sorted(BUILTIN_PROVIDERS):
+        path = BUILTIN_DIR / name
+        if common.lstat_kind(path) == stat.S_IFREG:
+            found[name] = Provider(name, [PYTHON, str(path)], "built-in", str(path), None)
+    try:
+        entries = safe.list_dir(USER_DIR, max_entries=USER_DIR_ENTRIES_MAX)
+    except (OSError, safe.UnsafeError) as e:
+        found["user-providers"] = Provider("user-providers", None, "user", str(USER_DIR),
+                                           f"skipped: {common.clean_text(str(e), 200)}")
+        return found
+    trusted = 0
+    for name, st in entries:
+        mode = st.st_mode
+        if name.startswith(".") or stat.S_ISDIR(mode):
             continue
-        for entry in sorted(directory.iterdir()):
-            if entry.is_file() and os.access(entry, os.X_OK) and not entry.name.startswith("."):
-                found[entry.name] = entry
+        if stat.S_ISREG(mode) and not mode & 0o111:
+            continue   # a README, or a provider switched off with chmod -x
+        path = USER_DIR / name
+        problem = None
+        if not NAME.fullmatch(name):
+            problem = "skipped: a provider name may only use letters, digits, . _ -"
+        elif stat.S_ISLNK(mode):
+            problem = "skipped: is a symlink"
+        elif not stat.S_ISREG(mode):
+            problem = "skipped: not a regular file"
+        elif trusted >= USER_PROVIDERS_MAX:
+            problem = f"skipped: more than {USER_PROVIDERS_MAX} user providers"
+        else:
+            try:
+                safe.trusted_user_file(path)
+            except (OSError, safe.UnsafeError) as e:
+                problem = f"skipped: {common.clean_text(str(e), 200)}"
+        if problem is None:
+            trusted += 1
+        label = common.clean_text(name, 64)
+        found[label] = Provider(label, None if problem else [str(path)], "user",
+                                common.clean_text(str(path), 300), problem)
     return found
 
 
+# ------------------------------------------------------------------ documents
+
+def _clamp(value, default, low, high):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
+        return default
+    return max(low, min(high, value))
+
+
+def sanitize(parsed, name):
+    """(doc, dropped actions). Only the documented fields survive, each typed and bounded,
+    every action validated -- the cache and the panel only ever see this form."""
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("rows"), list):
+        raise ValueError("missing rows")
+    rows, dropped = [], 0
+    for raw in parsed["rows"][:ROWS_MAX]:
+        if not isinstance(raw, dict):
+            continue
+        state = raw.get("state")
+        row = {"glyph": common.clean_text(raw.get("glyph"), 16),
+               "title": common.clean_text(raw.get("title"), STRING_MAX),
+               "detail": common.clean_text(raw.get("detail"), STRING_MAX),
+               "state": state if state in STATES else "idle"}
+        progress = _clamp(raw.get("progress"), None, 0, 100)
+        if progress is not None:
+            row["progress"] = progress
+        action = raw.get("action")
+        if action is not None and action != "":
+            try:
+                row["action"] = common.validate_action(action)
+            except common.ActionError:
+                dropped += 1
+        rows.append(row)
+    doc = {"section": common.clean_text(parsed.get("section"), 64) or name,
+           "glyph": common.clean_text(parsed.get("glyph"), 16),
+           "priority": _clamp(parsed.get("priority"), 50, -1000, 1000),
+           "intervalSec": _clamp(parsed.get("intervalSec"), 5, 1, 86400),
+           "timeoutSec": _clamp(parsed.get("timeoutSec"), TIMEOUT_DEFAULT, TIMEOUT_MIN, TIMEOUT_MAX),
+           "rows": rows}
+    return doc, dropped
+
+
 def cached(name):
-    path = CACHE / (name + ".json")
+    """(at, doc, warning, problem) from this provider's cache, re-validated on the way in."""
     try:
-        raw = json.loads(path.read_text())
-        return raw.get("at", 0), raw.get("doc")
-    except Exception:
-        return 0, None
-
-
-def store(name, doc):
-    CACHE.mkdir(parents=True, exist_ok=True)
-    tmp = CACHE / (name + ".json.tmp")
-    tmp.write_text(json.dumps({"at": time.time(), "doc": doc}))
-    tmp.replace(CACHE / (name + ".json"))
-
-
-def run_one(path, force=False):
-    """Returns (doc, note). A provider that fails yields (None, reason) rather than
-    raising, because the hub is more useful with four sections than with none."""
-    name = path.name
-    at, doc = cached(name)
-    interval = (doc or {}).get("intervalSec", 5) if doc else 0
-    if not force and doc is not None and (time.time() - at) < max(1, float(interval)):
-        return doc, "cached"
-    # A provider may declare its own budget: scanning repos or asking a mirror what is
-    # out of date legitimately takes longer than reading /proc. Taken from the cached
-    # document, since it is the provider itself that says so.
-    budget = float((doc or {}).get("timeoutSec", TIMEOUT))
-    budget = max(1.0, min(90.0, budget))
+        entry = safe.read_json(CACHE / f"{name}.json", CACHE_MAX, default=None,
+                               max_depth=10, max_items=40000, max_string=4 * STRING_MAX)
+    except (OSError, safe.UnsafeError) as e:
+        return 0.0, None, "", f"cache unreadable: {common.clean_text(str(e), 200)}"
+    if not isinstance(entry, dict):
+        return 0.0, None, "", None
     try:
-        r = subprocess.run([str(path)], capture_output=True, text=True, timeout=budget)
-    except subprocess.TimeoutExpired:
-        return doc, f"timed out after {budget:g}s"
-    except Exception as e:
-        return doc, f"failed to start: {e}"
+        doc, _ = sanitize(entry.get("doc"), name)
+    except ValueError:
+        return 0.0, None, "", None
+    return (_clamp(entry.get("at"), 0.0, 0.0, 1e11), doc,
+            common.clean_text(entry.get("warning"), 200), None)
+
+
+def store(name, doc, warning):
+    safe.write_json(CACHE / f"{name}.json", {"at": time.time(), "doc": doc, "warning": warning})
+
+
+def budget_for(provider, doc):
+    if doc is not None:
+        declared = doc["timeoutSec"]
+    elif provider.origin == "built-in":
+        declared = BUILTIN_PROVIDERS.get(provider.name, TIMEOUT_DEFAULT)
+    else:
+        declared = TIMEOUT_DEFAULT
+    return int(_clamp(declared, TIMEOUT_DEFAULT, TIMEOUT_MIN, TIMEOUT_MAX))
+
+
+def run_one(provider, force=False):
+    """(doc, note). A provider that fails yields its last good document and the reason,
+    because the hub is more useful with four sections than with none."""
+    if provider.argv is None:
+        return None, provider.problem
+    at, doc, warning, cache_problem = cached(provider.name)
+    if not force and doc is not None and (time.time() - at) < doc["intervalSec"]:
+        return doc, warning or "cached"
+    budget = budget_for(provider, doc)
+    # Under /usr/bin/timeout as well as safe.run's own deadline: if the shell's watchdog
+    # kills this runner mid-run, the provider's process group still dies on schedule.
+    try:
+        r = safe.run(["timeout", "--kill-after=2", str(budget), *provider.argv],
+                     timeout=budget + 3, max_output=OUTPUT_MAX)
+    except (OSError, safe.UnsafeError) as e:
+        return doc, f"failed to start: {common.clean_text(str(e), 160)}"
+    if r.truncated:
+        return doc, f"output exceeded {OUTPUT_MAX // 1024} KB"
+    if r.timed_out or r.returncode in (124, 137):
+        return doc, f"timed out after {budget}s"
     if r.returncode != 0:
-        return doc, f"exit {r.returncode}: {r.stderr.strip()[:120]}"
+        lines = r.stderr.decode("utf-8", "replace").strip().splitlines()
+        reason = common.clean_text(lines[-1], 120) if lines else ""
+        return doc, f"exit {r.returncode}" + (f": {reason}" if reason else "")
     out = r.stdout.strip()
     if not out:
         return None, "no output"
     try:
-        parsed = json.loads(out)
-    except Exception:
+        parsed = safe.loads(out, max_depth=8, max_items=20000, max_string=STRING_MAX)
+    except safe.TooLarge as e:
+        return doc, f"output exceeds limits: {e}"
+    except ValueError:
         return doc, "output was not JSON"
-    if not isinstance(parsed, dict) or "rows" not in parsed:
+    try:
+        fresh, dropped = sanitize(parsed, provider.name)
+    except ValueError:
         return doc, "missing rows"
-    parsed.setdefault("section", name)
-    parsed.setdefault("priority", 50)
-    parsed.setdefault("intervalSec", 5)
-    parsed.setdefault("timeoutSec", TIMEOUT)
-    parsed["rows"] = [r for r in parsed.get("rows", []) if isinstance(r, dict)]
-    store(name, parsed)
-    return parsed, "ok"
+    warning = (f"ignored {dropped} row action{'s' if dropped != 1 else ''} that "
+               f"{'are' if dropped != 1 else 'is'} not a structured action (see README)") if dropped else ""
+    try:
+        store(provider.name, fresh, warning)
+    except (OSError, safe.UnsafeError) as e:
+        return fresh, f"cache not written: {common.clean_text(str(e), 160)}"
+    if cache_problem:
+        return fresh, cache_problem
+    return fresh, warning or "ok"
 
 
 def collect(force=False, only=None):
+    """([(name, doc)], notes). Providers run concurrently: each is bounded by its own
+    30 s ceiling, so the whole run is too, whatever the number of providers."""
+    chosen = [p for name, p in discover().items() if not only or only in name]
+    results = {}
+    if chosen:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(chosen)) as pool:
+            futures = [(p.name, pool.submit(run_one, p, force)) for p in chosen]
+            for name, future in futures:
+                try:
+                    results[name] = future.result()
+                except Exception as e:   # a bug in one provider's handling is still just one note
+                    results[name] = (None, f"runner error: {common.clean_text(str(e), 120)}")
     sections, notes = [], {}
-    for name, path in discover().items():
-        if only and only not in name:
-            continue
-        doc, note = run_one(path, force=force)
-        notes[name] = note
-        if doc and doc.get("rows"):
-            sections.append(doc)
-    sections.sort(key=lambda s: (s.get("priority", 50), s.get("section", "")))
+    for p in chosen:
+        doc, note = results[p.name]
+        notes[p.name] = note
+        if doc and doc["rows"]:
+            sections.append((p.name, doc))
+    sections.sort(key=lambda item: (item[1]["priority"], item[1]["section"]))
     return sections, notes
 
 
+def document(sections, notes, limit=None):
+    """The panel's JSON, at most HUB_OUTPUT_MAX bytes: a section that does not fit is
+    dropped with a note rather than cutting the document off mid-way."""
+    limit = HUB_OUTPUT_MAX if limit is None else limit
+    size = 4096 + len(json.dumps(notes, ensure_ascii=False).encode("utf-8"))
+    kept = []
+    for name, doc in sections:
+        blob = len(json.dumps(doc, ensure_ascii=False).encode("utf-8")) + 1
+        if size + blob > limit:
+            notes[name] = "dropped: hub output budget exceeded"
+            continue
+        kept.append(doc)
+        size += blob
+    return json.dumps({"sections": kept, "notes": notes}, ensure_ascii=False)
+
+
+# ------------------------------------------------------------------ actions
+
+def read_line(stream, limit):
+    """One newline-terminated record, at most limit bytes. The panel writes the action and
+    a newline and leaves stdin open, so this must not wait for EOF."""
+    data = stream.readline(limit + 2)
+    body = data[:-1] if data.endswith(b"\n") else data
+    if len(body) > limit:
+        raise safe.TooLarge(f"action exceeds {limit} bytes")
+    return body
+
+
+def resolve(action):
+    """(absolute argv, extra env) for a validated terminal or run action."""
+    tool, args = action["argv"][0], action["argv"][1:]
+    if tool == "git":
+        argv = common.git_command(args[1], *args[2:])
+        if argv is None:
+            raise common.ActionError("could not inspect that repository's git config safely")
+        return [safe.tool("git"), *argv[1:]], dict(common.GIT_ENV)
+    return [safe.tool(tool), *args], {}
+
+
+def perform(action):
+    """Carry out a validated action. Returns what the panel must start itself, or None."""
+    if action["kind"] == "focus-window":
+        # Hyprland 0.56 dispatchers are Lua; the address was matched against
+        # 0x[0-9a-fA-F]{1,16}, so nothing else can reach the expression.
+        expr = 'hl.dsp.focus({ window = "address:%s" })' % action["address"]
+        r = safe.run(["hyprctl", "dispatch", expr], timeout=3, max_output=16 * 1024)
+        if not r.ok:
+            raise common.ActionError(f"hyprctl dispatch failed: {common.clean_text(r.text().strip(), 160)}")
+        return None
+    argv, env = resolve(action)
+    if action["kind"] == "run":
+        safe.spawn(argv, timeout=common.RUN_TIMEOUT.get(action["argv"][0], common.RUN_TIMEOUT_DEFAULT),
+                   env=env or None)
+        return None
+    # terminal: the presentation wrapper builds `bash -c "...; $*; ..."` from its arguments,
+    # so every word is shell-quoted here and bash reads back exactly this argv. The env
+    # words are this module's constants (NAME=digit). A terminal is the user's to close and
+    # cannot live under a deadline, so the panel starts it detached -- as the shell's own
+    # panels launch apps -- after checking that the program is this wrapper.
+    words = [f"{key}={value}" for key, value in sorted(env.items())]
+    words += [shlex.quote(word) for word in argv]
+    return {"exec": [safe.tool(TERMINAL), " ".join(words)]}
+
+
+def action_main(stream=None):
+    stream = stream or sys.stdin.buffer
+    try:
+        raw = read_line(stream, common.ACTION_MAX)
+        action = common.validate_action(
+            safe.loads(raw, max_depth=4, max_items=64, max_string=common.ARG_MAX))
+        result = perform(action)
+    except (ValueError, OSError, safe.UnsafeError) as e:
+        print(f"cockpit action: {common.clean_text(str(e), 300)}", file=sys.stderr)
+        return 2
+    if result is not None:
+        print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+# ------------------------------------------------------------------ main
+
 def main(argv):
+    safe.die_with_parent()
+    if argv[:1] == ["action"]:
+        return action_main()
+
     if "--list" in argv:
-        for name, path in discover().items():
-            origin = "user" if str(path).startswith(str(USER)) else "built-in"
-            print(f"  {name:16} {origin:9} {path}")
+        for name, p in discover().items():
+            print(f"  {name:16} {p.origin:9} {p.path}" + (f"  ({p.problem})" if p.problem else ""))
         return 0
 
     only = None
@@ -144,17 +376,17 @@ def main(argv):
     sections, notes = collect(force="--force" in argv or only is not None, only=only)
 
     if "--plain" in argv:
-        for s in sections:
-            print(f"{s.get('glyph','')} {s['section']}")
+        for _, s in sections:
+            print(f"{s['glyph']} {s['section']}")
             for row in s["rows"]:
-                bar = f" [{row['progress']:>3}%]" if isinstance(row.get("progress"), (int, float)) else ""
-                print(f"    {row.get('glyph','')} {row.get('title','')}{bar}  {row.get('detail','')}")
-        broken = {k: v for k, v in notes.items() if v not in ("ok", "cached")}
-        for k, v in broken.items():
-            print(f"  ! {k}: {v}", file=sys.stderr)
+                bar = f" [{row['progress']:>3.0f}%]" if "progress" in row else ""
+                print(f"    {row['glyph']} {row['title']}{bar}  {row['detail']}")
+        for k, v in notes.items():
+            if v not in ("ok", "cached"):
+                print(f"  ! {k}: {v}", file=sys.stderr)
         return 0
 
-    print(json.dumps({"sections": sections, "notes": notes}, ensure_ascii=False))
+    print(document(sections, notes))
     return 0
 
 

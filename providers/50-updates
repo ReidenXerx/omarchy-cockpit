@@ -1,56 +1,71 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Pending updates, without touching the network on every tick.
 
 checkupdates syncs a temporary database rather than the system one, so it is safe to run
 without root and cannot leave pacman in a partial-sync state. Its cost is real though, so
-this provider declares a long interval and the runner caches it.
+this provider declares a long interval and the runner caches it. The three sources are
+asked at once, each under its own deadline, so together they fit the 30 s budget.
 """
+import concurrent.futures
 import json
-import shutil
-import subprocess
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "bin"))
+import plugin_safety as safe  # noqa: E402
+import cockpit_common as common  # noqa: E402
+
+SOURCE_TIMEOUT = 25
+OUTPUT_MAX = 1024 * 1024
 
 
-def count(cmd, timeout=25):
+def count(argv):
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    except Exception:
+        r = safe.run(argv, timeout=SOURCE_TIMEOUT, max_output=OUTPUT_MAX)
+    except (OSError, safe.UnsafeError):
         return None
     # checkupdates exits 2 when there is simply nothing to do.
-    if r.returncode not in (0, 2):
+    if r.timed_out or r.truncated or r.returncode not in (0, 2):
         return None
-    return len([l for l in r.stdout.splitlines() if l.strip()])
+    return len([l for l in r.text().splitlines() if l.strip()])
+
+
+def row(glyph, title, detail, argv):
+    out = {"glyph": glyph, "title": title, "detail": detail, "state": "warn"}
+    action = common.action_or_none({"kind": "terminal", "argv": argv})
+    if action:
+        out["action"] = action
+    return out
+
+
+def plural(n, word):
+    return f"{n} {word}{'s' if n != 1 else ''}"
 
 
 def main():
+    helper = next((h for h in ("yay", "paru") if safe.has_tool(h)), None)
+    jobs = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        if safe.has_tool("checkupdates"):
+            jobs["pacman"] = pool.submit(count, ["checkupdates"])
+        if helper:
+            jobs["aur"] = pool.submit(count, [helper, "-Qua"])
+        if safe.has_tool("flatpak"):
+            jobs["flatpak"] = pool.submit(count, ["flatpak", "remote-ls", "--updates"])
+    found = {name: job.result() for name, job in jobs.items()}
+
     rows = []
-
-    if shutil.which("checkupdates"):
-        n = count(["checkupdates"])
-        if n:
-            rows.append({"glyph": "󰏔", "title": f"{n} official package{'s' if n != 1 else ''}",
-                         "detail": "pacman", "state": "warn",
-                         "action": "omarchy-launch-floating-terminal-with-presentation checkupdates"})
-
-    for helper in ("yay", "paru"):
-        if shutil.which(helper):
-            n = count([helper, "-Qua"])
-            if n:
-                rows.append({"glyph": "󰣇", "title": f"{n} AUR package{'s' if n != 1 else ''}",
-                             "detail": helper, "state": "warn",
-                             "action": f"omarchy-launch-floating-terminal-with-presentation {helper} -Qua"})
-            break
-
-    if shutil.which("flatpak"):
-        n = count(["flatpak", "remote-ls", "--updates"], timeout=30)
-        if n:
-            rows.append({"glyph": "󰏖", "title": f"{n} flatpak{'s' if n != 1 else ''}",
-                         "detail": "flatpak", "state": "warn",
-                         "action": "omarchy-launch-floating-terminal-with-presentation flatpak update"})
+    if found.get("pacman"):
+        rows.append(row("󰏔", plural(found["pacman"], "official package"), "pacman", ["checkupdates"]))
+    if found.get("aur"):
+        rows.append(row("󰣇", plural(found["aur"], "AUR package"), helper, [helper, "-Qua"]))
+    if found.get("flatpak"):
+        rows.append(row("󰏖", plural(found["flatpak"], "flatpak"), "flatpak", ["flatpak", "update"]))
 
     print(json.dumps({"section": "Updates", "glyph": "󰚰", "priority": 50,
                       # Quarter of an hour: nothing here changes faster than that, and
                       # each source costs a network round trip.
-                      "intervalSec": 900, "timeoutSec": 60, "rows": rows}, ensure_ascii=False))
+                      "intervalSec": 900, "timeoutSec": 30, "rows": rows}, ensure_ascii=False))
 
 
 if __name__ == "__main__":

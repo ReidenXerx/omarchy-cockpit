@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "reidenxerx.cockpit",
   "name": "Cockpit",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "ReidenXerx",
   "license": "MIT",
   "description": "One hub for what the machine is doing right now: which AI sessions are working and on what, file transfers with real progress, long-running jobs, dirty repos, pending updates. Extensible with your own providers.",

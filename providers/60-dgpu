@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Discrete GPU power state, without waking it.
 
 Everything here is a cached sysfs attribute. lspci, nvidia-smi and current_link_speed all
@@ -6,50 +6,62 @@ read PCI config space or talk to the driver, and the kernel resumes a suspended 
 serve that -- a status widget that used them would wake the very thing it reports on.
 """
 import json
+import os
 import pathlib
+import re
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "bin"))
+import plugin_safety as safe  # noqa: E402
+import cockpit_common as common  # noqa: E402
 
 NAMES = {"D0": "awake", "D3hot": "sleeping", "D3cold": "deep sleep"}
+DRIVER = "/sys/bus/pci/drivers/nvidia"
+PCI_NAME = re.compile(r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]")
 
 
 def device():
-    root = pathlib.Path("/sys/bus/pci/drivers/nvidia")
-    for entry in sorted(root.glob("0000:*")):
-        return entry
-    return None
+    try:
+        with os.scandir(DRIVER) as it:
+            names = sorted(e.name for e in it if PCI_NAME.fullmatch(e.name))
+    except OSError:
+        return None
+    return f"{DRIVER}/{names[0]}" if names else None
 
 
 def read(path, default=""):
     try:
-        return path.read_text().strip()
-    except Exception:
+        blob = safe.read_system_file(path, 256)
+    except (OSError, safe.UnsafeError):
         return default
+    return default if blob is None else blob.decode("utf-8", "replace").strip()
+
+
+def read_int(path):
+    try:
+        return int(read(path, "0") or 0)
+    except ValueError:
+        return 0
 
 
 def holders():
     """Processes with the device open. Only this user's are visible without root, which
     is worth knowing: nvidia-persistenced runs as its own user and never shows here."""
-    found = []
-    for proc in pathlib.Path("/proc").iterdir():
-        if not proc.name.isdigit():
-            continue
-        try:
-            for fd in (proc / "fd").iterdir():
-                if "nvidia" in str(fd.resolve()):
-                    found.append(read(proc / "comm", proc.name))
-                    break
-        except Exception:
-            continue
-    return sorted(set(found))
+    found = set()
+    for pid in common.pids():
+        if any("nvidia" in target for _, target, _ in common.open_files(pid, with_stat=False)):
+            found.add((common.proc_read(pid, "comm", 64) or pid).strip())
+    return sorted(found)
 
 
 def main():
     dev = device()
     rows = []
     if dev:
-        state = read(dev / "power_state", "?")
-        status = read(dev / "power/runtime_status", "?")
-        awake_ms = int(read(dev / "power/runtime_active_time", "0") or 0)
-        asleep_ms = int(read(dev / "power/runtime_suspended_time", "0") or 0)
+        state = read(f"{dev}/power_state", "?")
+        status = read(f"{dev}/power/runtime_status", "?")
+        awake_ms = read_int(f"{dev}/power/runtime_active_time")
+        asleep_ms = read_int(f"{dev}/power/runtime_suspended_time")
         total = awake_ms + asleep_ms
         duty = (100.0 * awake_ms / total) if total else 0.0
 
@@ -67,7 +79,7 @@ def main():
         })
 
     print(json.dumps({"section": "GPU", "glyph": "\U000f03ae", "priority": 60,
-                      "intervalSec": 5, "rows": rows}, ensure_ascii=False))
+                      "intervalSec": 5, "timeoutSec": 6, "rows": rows}, ensure_ascii=False))
 
 
 if __name__ == "__main__":

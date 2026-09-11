@@ -1,21 +1,29 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """File operations in flight, with real progress.
 
 No external tool needed: a process copying, downloading or hashing a file holds an fd on
 it, /proc/PID/fdinfo/N carries that descriptor's byte offset, and stat gives the size.
 Offset over size is the progress bar. Sampling the offset twice would give a rate, but a
 provider runs once per tick, so the rate is derived from the previous tick's offset held
-in the cache instead.
+in the state file instead.
 """
 import json
 import os
 import pathlib
+import stat
+import sys
 import time
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "bin"))
+import plugin_safety as safe  # noqa: E402
+import cockpit_common as common  # noqa: E402
 
 WATCH = {"cp", "mv", "rsync", "curl", "wget", "dd", "tar", "gzip", "zstd", "xz",
          "sha256sum", "md5sum", "cpio", "rclone", "scp", "sftp", "ffmpeg", "pv"}
-STATE = pathlib.Path(os.environ.get("XDG_CACHE_HOME") or pathlib.Path.home() / ".cache") / "omarchy-cockpit"
-MARKS = STATE / "transfer-marks.json"
+MARKS = common.state_dir() / "transfer-marks.json"
+MARKS_FILE_MAX = 256 * 1024
+MARKS_MAX = 256
+ROWS_MAX = 64
 MIN_SIZE = 8 * 1024 * 1024      # below this it is over before a bar could render
 
 
@@ -26,80 +34,77 @@ def human(n):
         n /= 1024
 
 
+def position(pid, fd):
+    for line in (common.proc_read(pid, f"fdinfo/{fd}", 4096) or "").splitlines():
+        if line.startswith("pos:"):
+            try:
+                return int(line.split()[1])
+            except (IndexError, ValueError):
+                return 0
+    return 0
+
+
 def main():
     now = time.time()
     try:
-        marks = json.loads(MARKS.read_text())
-    except Exception:
+        marks = safe.read_json(MARKS, MARKS_FILE_MAX, default={}, max_depth=4, max_items=4096,
+                               max_string=8192)
+    except (OSError, safe.UnsafeError):
+        marks = {}
+    if not isinstance(marks, dict):
         marks = {}
     fresh, rows = {}, []
 
-    for proc in pathlib.Path("/proc").iterdir():
-        if not proc.name.isdigit():
-            continue
-        try:
-            comm = (proc / "comm").read_text().strip()
-        except Exception:
-            continue
+    for pid in common.pids():
+        comm = (common.proc_read(pid, "comm", 64) or "").strip()
         if comm not in WATCH:
             continue
-        try:
-            fds = list((proc / "fd").iterdir())
-        except Exception:
-            continue    # another user's process, or it exited between the two calls
-
+        # The largest file this process is touching is the one worth showing; a copy
+        # also holds its destination, and a tar holds dozens of small members.
         best = None
-        for fd in fds:
-            try:
-                target = fd.resolve()
-                if not target.is_file():
-                    continue
-                size = target.stat().st_size
-                if size < MIN_SIZE:
-                    continue
-                info = (proc / "fdinfo" / fd.name).read_text()
-                pos = next((int(l.split()[1]) for l in info.splitlines() if l.startswith("pos:")), 0)
-            except Exception:
+        for fd, target, st in common.open_files(pid):
+            if not stat.S_ISREG(st.st_mode) or st.st_size < MIN_SIZE:
                 continue
-            # The largest file this process is touching is the one worth showing; a copy
-            # also holds its destination, and a tar holds dozens of small members.
-            if best is None or size > best[1]:
-                best = (target, size, pos)
-
+            if best is None or st.st_size > best[2]:
+                best = (fd, target, st.st_size)
         if not best:
             continue
-        target, size, pos = best
-        key = f"{proc.name}:{target}"
-        prev = marks.get(key)
+        fd, target, size = best
+        pos = position(pid, fd)
+        key = f"{pid}:{target}"[:1024]
+        prev = marks.get(key) if isinstance(marks.get(key), dict) else None
         rate = ""
-        if prev and now > prev["at"]:
-            delta = pos - prev["pos"]
-            seconds = now - prev["at"]
+        if prev:
+            prev_at, prev_pos = common.number(prev.get("at")), common.number(prev.get("pos"))
+            delta, seconds = pos - prev_pos, now - prev_at
             if delta > 0 and seconds > 0.5:
                 per_sec = delta / seconds
                 remaining = (size - pos) / per_sec if per_sec > 0 else 0
-                eta = f" · {int(remaining//60)}m{int(remaining%60):02d}s left" if remaining > 90 else \
+                eta = f" · {int(remaining // 60)}m{int(remaining % 60):02d}s left" if remaining > 90 else \
                       (f" · {int(remaining)}s left" if remaining > 1 else "")
                 rate = f" · {human(per_sec)}/s{eta}"
-        fresh[key] = {"pos": pos, "at": now}
+        if len(fresh) < MARKS_MAX:
+            fresh[key] = {"pos": pos, "at": now}
 
         pct = int(100 * pos / size) if size else 0
         rows.append({
             "glyph": "󰄠",
-            "title": f"{comm}  {target.name}",
+            "title": f"{comm}  {os.path.basename(target)[:200]}",
             "detail": f"{human(pos)} of {human(size)}{rate}",
             "state": "busy",
             "progress": max(0, min(100, pct)),
         })
+        if len(rows) >= ROWS_MAX:
+            break
 
-    STATE.mkdir(parents=True, exist_ok=True)
-    tmp = MARKS.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(fresh))
-    tmp.replace(MARKS)
+    try:
+        safe.write_json(MARKS, fresh)
+    except (OSError, safe.UnsafeError):
+        pass
 
     rows.sort(key=lambda r: -r["progress"])
     print(json.dumps({"section": "Transfers", "glyph": "󰇚", "priority": 20,
-                      "intervalSec": 1, "rows": rows}, ensure_ascii=False))
+                      "intervalSec": 1, "timeoutSec": 6, "rows": rows}, ensure_ascii=False))
 
 
 if __name__ == "__main__":

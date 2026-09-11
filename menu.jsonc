@@ -11,10 +11,10 @@
   "setup.cockpit.status": {
     "icon": "󰋽",
     "label": "Show status in a terminal",
-    "action": "omarchy-launch-floating-terminal-with-presentation @PLUGIN_BIN@/cockpit --plain"
+    "action": "omarchy-launch-floating-terminal-with-presentation /usr/bin/python3 @PLUGIN_BIN@/cockpit --plain"
   },
   "setup.cockpit.providers": {
     "icon": "󰅩",
     "label": "List providers",
-    "action": "omarchy-launch-floating-terminal-with-presentation @PLUGIN_BIN@/cockpit --list"
+    "action": "omarchy-launch-floating-terminal-with-presentation /usr/bin/python3 @PLUGIN_BIN@/cockpit --list"
   },

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Filesystems worth worrying about, and volumes that are not mounted.
 
 Quiet by design: a disk at 58% is not news. Only speaks past a threshold, or when a drive
@@ -7,32 +7,43 @@ you normally use is absent.
 import json
 import pathlib
 import shutil
-import subprocess
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "bin"))
+import plugin_safety as safe  # noqa: E402
+import cockpit_common as common  # noqa: E402
 
 WARN_PERCENT = 85
 IGNORE_TYPES = {"tmpfs", "devtmpfs", "squashfs", "overlay", "efivarfs", "ramfs"}
+OUTPUT_MAX = 1024 * 1024
+ROWS_MAX = 64
 
 
-def main():
-    rows = []
+def run_json(argv):
     try:
-        out = subprocess.run(["findmnt", "-rno", "TARGET,FSTYPE,SOURCE"],
-                             capture_output=True, text=True, timeout=6).stdout
-    except Exception:
-        out = ""
+        r = safe.run(argv, timeout=6, max_output=OUTPUT_MAX)
+        if not r.ok:
+            return {}
+        data = safe.loads(r.stdout, max_depth=32, max_items=50000, max_string=4096)
+    except (OSError, ValueError, safe.UnsafeError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
-    seen = set()
-    for line in out.splitlines():
-        parts = line.split()
-        if len(parts) < 3:
+
+def full_filesystems(mounts):
+    rows, seen = [], set()
+    for fs in mounts if isinstance(mounts, list) else []:
+        if not isinstance(fs, dict):
             continue
-        target, fstype, source = parts[0], parts[1], parts[2]
-        if fstype in IGNORE_TYPES or not source.startswith("/dev/") or source in seen:
+        target, fstype, source = (fs.get(k) if isinstance(fs.get(k), str) else ""
+                                  for k in ("target", "fstype", "source"))
+        if fstype in IGNORE_TYPES or not source.startswith("/dev/") or source in seen \
+                or not target.startswith("/"):
             continue
         seen.add(source)
         try:
             usage = shutil.disk_usage(target)
-        except Exception:
+        except OSError:
             continue
         pct = 100.0 * usage.used / usage.total if usage.total else 0
         if pct < WARN_PERCENT:
@@ -44,34 +55,44 @@ def main():
             "state": "warn",
             "progress": int(pct),
         })
+    return rows
 
-    # A large unmounted filesystem is usually a drive you mount on demand -- worth a line
-    # so "where are my games" is answered without opening a file manager.
-    try:
-        blk = json.loads(subprocess.run(
-            ["lsblk", "-Jo", "NAME,SIZE,FSTYPE,MOUNTPOINT,LABEL"],
-            capture_output=True, text=True, timeout=6).stdout)
-    except Exception:
-        blk = {}
 
-    def walk(nodes):
-        for n in nodes:
-            fstype = n.get("fstype") or ""
-            if fstype and fstype not in ("swap",) and not n.get("mountpoint"):
-                size = str(n.get("size", ""))
+def unmounted(devices):
+    """A large unmounted filesystem is usually a drive you mount on demand -- worth a line
+    so "where are my games" is answered without opening a file manager."""
+    rows = []
+
+    def walk(nodes, depth):
+        for n in nodes if isinstance(nodes, list) and depth < 8 else []:
+            if not isinstance(n, dict) or len(rows) >= ROWS_MAX:
+                continue
+            fstype = n.get("fstype") if isinstance(n.get("fstype"), str) else ""
+            if fstype and fstype != "swap" and not n.get("mountpoint"):
                 label = n.get("label") or n.get("name")
-                rows.append({
+                row = {
                     "glyph": "\U000f02ca",
-                    "title": f"{label} not mounted",
-                    "detail": f"{size} · {fstype}",
+                    "title": f"{common.clean_text(label, 128)} not mounted",
+                    "detail": f"{common.clean_text(n.get('size', ''), 32)} · {common.clean_text(fstype, 32)}",
                     "state": "idle",
-                    "action": f"udisksctl mount -b /dev/{n.get('name')}",
-                })
-            walk(n.get("children") or [])
-    walk(blk.get("blockdevices") or [])
+                }
+                path = n.get("path")
+                action = common.action_or_none({"kind": "run", "argv": ["udisksctl", "mount", "-b", path]}) \
+                    if isinstance(path, str) else None
+                if action:
+                    row["action"] = action
+                rows.append(row)
+            walk(n.get("children"), depth + 1)
 
+    walk(devices, 0)
+    return rows
+
+
+def main():
+    rows = full_filesystems(run_json(["findmnt", "-J", "-l", "-o", "TARGET,FSTYPE,SOURCE"]).get("filesystems"))
+    rows += unmounted(run_json(["lsblk", "-J", "-o", "NAME,PATH,SIZE,FSTYPE,MOUNTPOINT,LABEL"]).get("blockdevices"))
     print(json.dumps({"section": "Disks", "glyph": "\U000f02ca", "priority": 80,
-                      "intervalSec": 60, "rows": rows}, ensure_ascii=False))
+                      "intervalSec": 60, "timeoutSec": 10, "rows": rows[:ROWS_MAX]}, ensure_ascii=False))
 
 
 if __name__ == "__main__":

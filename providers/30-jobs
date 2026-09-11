@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Long-running commands started from a shell, with elapsed time.
 
 The builds, installs and test runs you kicked off in some other workspace and stopped
@@ -8,7 +8,10 @@ an editor or a daemon.
 import json
 import os
 import pathlib
-import time
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "bin"))
+import cockpit_common as common  # noqa: E402
 
 SHELLS = {"bash", "zsh", "fish", "sh", "dash"}
 # Things that are legitimately long-lived and would otherwise fill the section forever.
@@ -23,42 +26,37 @@ MIN_AGE = 20.0
 # Session infrastructure that does hold a tty and would otherwise sit here for the whole
 # uptime. Matched on the command line, because the binary alone (systemctl) is legitimate.
 BORING_PATTERNS = ("--wait wayland-session", "uwsm", "session-envelope", "dbus-run-session")
+CMDLINE_MAX = 64 * 1024
 
 
 def clock_ticks():
     try:
         return os.sysconf("SC_CLK_TCK")
-    except Exception:
+    except (OSError, ValueError):
         return 100
 
 
-def uptime():
-    return float(pathlib.Path("/proc/uptime").read_text().split()[0])
-
-
 def main():
-    hz, up, rows = clock_ticks(), uptime(), []
+    hz, up, rows = clock_ticks(), common.uptime(), []
     procs = {}
 
-    for entry in pathlib.Path("/proc").iterdir():
-        if not entry.name.isdigit():
+    for pid in common.pids():
+        stat = common.proc_read(pid, "stat", 4096)
+        comm = common.proc_read(pid, "comm", 64)
+        if stat is None or comm is None:
             continue
-        try:
-            stat = (entry / "stat").read_text()
-            comm = (entry / "comm").read_text().strip()
-        except Exception:
-            continue
+        comm = comm.strip()
         # comm can contain spaces and parens, so read the fields after the last ')'.
         tail = stat[stat.rfind(")") + 2:].split()
         try:
             ppid = int(tail[1])
             tty = int(tail[4])
             starttime = int(tail[19])
-        except Exception:
+        except (IndexError, ValueError):
             continue
-        procs[int(entry.name)] = (comm, ppid, up - starttime / hz, entry, tty)
+        procs[int(pid)] = (comm, ppid, up - starttime / hz, tty)
 
-    for pid, (comm, ppid, age, entry, tty) in procs.items():
+    for pid, (comm, ppid, age, tty) in procs.items():
         if comm in BORING or comm in TRANSFERS or age < MIN_AGE:
             continue
         # A controlling terminal is what separates "something you typed" from session
@@ -70,14 +68,11 @@ def main():
         # Only jobs a shell started: everything else is a service or a child of an app.
         if not parent or parent[0] not in SHELLS:
             continue
-        try:
-            cmdline = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace").strip()
-        except Exception:
-            cmdline = comm
+        cmdline = (common.proc_read(pid, "cmdline", CMDLINE_MAX) or "").replace("\0", " ").strip()
         if any(pat in cmdline for pat in BORING_PATTERNS):
             continue
         mins, secs = int(age // 60), int(age % 60)
-        elapsed = f"{mins//60}h {mins%60:02d}m" if mins >= 60 else (f"{mins}m {secs:02d}s" if mins else f"{secs}s")
+        elapsed = f"{mins // 60}h {mins % 60:02d}m" if mins >= 60 else (f"{mins}m {secs:02d}s" if mins else f"{secs}s")
         rows.append({
             "glyph": "󰅢",
             "title": (cmdline or comm)[:70],
@@ -87,7 +82,7 @@ def main():
 
     rows.sort(key=lambda r: r["title"])
     print(json.dumps({"section": "Jobs", "glyph": "󰅢", "priority": 30,
-                      "intervalSec": 5, "rows": rows}, ensure_ascii=False))
+                      "intervalSec": 5, "timeoutSec": 6, "rows": rows[:200]}, ensure_ascii=False))
 
 
 if __name__ == "__main__":

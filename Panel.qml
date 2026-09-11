@@ -16,7 +16,9 @@ Panel {
   property var hostWidget: null
   readonly property var barIdentity: hostWidget || root
 
-  readonly property string pluginBin: String(Qt.resolvedUrl("bin/")).replace("file://", "")
+  readonly property string pluginBin: decodeURIComponent(String(Qt.resolvedUrl("bin/")).replace(/^file:\/\//, ""))
+  readonly property string python: "/usr/bin/python3"
+  readonly property string terminalLauncher: "/usr/bin/omarchy-launch-floating-terminal-with-presentation"
   readonly property int rowsPerSection: Number(setting("rowsPerSection", 6))
   readonly property int refreshSec: Number(setting("refreshSec", 3))
 
@@ -31,25 +33,60 @@ Panel {
 
   Process {
     id: runner
-    command: [root.pluginBin + "cockpit"]
+    command: [root.python, root.pluginBin + "cockpit"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
         var parsed = Model.parse(text)
+        if (!parsed.ok) {
+          root.notes = { "cockpit": "the runner produced no usable output" }
+          return
+        }
         root.sections = parsed.sections
         root.notes = parsed.notes
       }
     }
+    onStarted: runnerWatchdog.restart()
+    onExited: runnerWatchdog.stop()
   }
 
   function refresh() { if (!runner.running) runner.running = true }
+
+  // Providers run in parallel, each under a 30 s ceiling, so a runner still going after
+  // 45 s is stuck -- and since a refresh is skipped while one is running, a stuck runner
+  // would otherwise freeze the hub for good. TERM first, KILL if that is ignored.
+  Timer {
+    id: runnerWatchdog
+    interval: 45000
+    onTriggered: root.stopProcess(runner, runnerKill)
+  }
+  Timer {
+    id: runnerKill
+    interval: 2000
+    onTriggered: if (runner.running) runner.signal(9)
+  }
+
+  function stopProcess(proc, killTimer) {
+    if (!proc.running) return
+    proc.signal(15)
+    killTimer.restart()
+  }
 
   // The daemon is what makes "which agent is busy" accurate -- hyprctl serves a cached
   // title. Started from here rather than an autostart entry so it dies with the shell.
   Process {
     id: agentd
-    command: [root.pluginBin + "cockpit-agentd"]
+    command: [root.python, root.pluginBin + "cockpit-agentd"]
     running: true
+    // It exits when Hyprland's socket closes or another copy already holds it; try again
+    // later rather than losing busy-detection until the shell restarts.
+    onExited: agentdRestart.restart()
+  }
+
+  Timer {
+    id: agentdRestart
+    interval: 30000
+    onTriggered: if (!agentd.running) agentd.running = true
   }
 
   Timer {
@@ -72,11 +109,44 @@ Panel {
     onTriggered: root.refresh()
   }
 
-  Process { id: actionProc }
+  // A row's action is a structured object, never a shell string. It travels to the
+  // helper over stdin, which validates it against an allow-list and performs it; the one
+  // thing it hands back is a presentation-terminal argv, started detached here because a
+  // terminal must outlive the helper.
+  Process {
+    id: actionProc
+    property string payload: ""
+    command: [root.python, root.pluginBin + "cockpit", "action"]
+    stdinEnabled: true
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var argv = Model.terminalLaunch(text, root.terminalLauncher)
+        if (argv) Quickshell.execDetached(argv)
+      }
+    }
+    onStarted: {
+      write(payload + "\n")
+      payload = ""
+      actionWatchdog.restart()
+    }
+    onExited: actionWatchdog.stop()
+  }
 
-  function runAction(command) {
-    if (!command) return
-    actionProc.command = ["sh", "-c", command]
+  Timer {
+    id: actionWatchdog
+    interval: 10000
+    onTriggered: root.stopProcess(actionProc, actionKill)
+  }
+  Timer {
+    id: actionKill
+    interval: 2000
+    onTriggered: if (actionProc.running) actionProc.signal(9)
+  }
+
+  function runAction(actionJson) {
+    if (!actionJson || actionProc.running) return
+    actionProc.payload = actionJson
     actionProc.running = true
     root.close()
   }

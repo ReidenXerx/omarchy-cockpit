@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Watch Hyprland window titles and record when each last changed.
 
 Why a daemon rather than polling: `hyprctl clients` serves a cached title. Sampled ten
@@ -6,107 +6,257 @@ times over two seconds it returns the identical glyph while the compositor's own
 socket is reporting the spinner turning. So the only accurate source for "is this session
 working right now" is the event stream, and something has to hold that socket open.
 
-Writes ~/.cache/omarchy-cockpit/agent-state.json:
+Writes $XDG_RUNTIME_DIR/omarchy-cockpit/agent-state.json:
   { "0x55...": {"title": "...", "changedAt": 1788..., "changes": 12} }
 
-Idempotent: a second instance exits rather than competing for the socket.
+Bounded throughout: an event line over 8 KB is discarded, the read buffer never exceeds
+64 KB, titles are cut to 256 characters and at most 256 windows are tracked (the least
+recently changed go first). Exits with the shell that started it. Idempotent: a second
+instance exits rather than competing for the socket.
 """
-import json
 import os
 import pathlib
+import re
+import signal
 import socket
+import stat
 import sys
 import time
 
-CACHE = pathlib.Path(os.environ.get("XDG_CACHE_HOME") or pathlib.Path.home() / ".cache") / "omarchy-cockpit"
-STATE = CACHE / "agent-state.json"
-LOCK = CACHE / "agentd.pid"
+BIN = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(BIN))
+import plugin_safety as safe  # noqa: E402
+import cockpit_common as common  # noqa: E402
+
+STATE_DIR = common.state_dir()
+STATE = STATE_DIR / "agent-state.json"
+LOCK = STATE_DIR / "agentd.pid"
 FLUSH_EVERY = 0.5
+RECV_SIZE = 8192
+LINE_MAX = 8 * 1024
+BUFFER_MAX = 64 * 1024
+TITLE_MAX = 256
+WINDOWS_MAX = 256
+STATE_MAX = 1024 * 1024
+HEX = re.compile(r"[0-9a-fA-F]{1,16}")
+SIGNATURE = re.compile(r"[A-Za-z0-9_]{1,128}")
+
+
+class LineReader:
+    """Splits the event stream into lines without ever holding more than buffer_max bytes.
+    A single event longer than line_max is dropped whole: a title can be arbitrarily long,
+    and the rest of one is not worth unbounded memory."""
+
+    def __init__(self, line_max=LINE_MAX, buffer_max=BUFFER_MAX):
+        self.line_max, self.buffer_max = line_max, buffer_max
+        self.buf = bytearray()
+        self.discarding = False
+
+    def feed(self, chunk):
+        lines = []
+        step = max(1, self.buffer_max - self.line_max)
+        for start in range(0, len(chunk), step):
+            # Invariant: buf <= line_max before this, so <= buffer_max after it.
+            self.buf += chunk[start:start + step]
+            while True:
+                nl = self.buf.find(b"\n")
+                if nl < 0:
+                    if len(self.buf) > self.line_max:
+                        self.buf.clear()
+                        self.discarding = True
+                    break
+                line = bytes(self.buf[:nl])
+                del self.buf[:nl + 1]
+                if self.discarding:
+                    self.discarding = False   # the tail of an oversized event
+                    continue
+                if len(line) <= self.line_max:
+                    lines.append(line)
+        return lines
+
+
+def address(raw):
+    """"0x<hex>" for a Hyprland window address with or without its prefix, else None."""
+    s = raw.strip()
+    if s[:2].lower() == "0x":
+        s = s[2:]
+    return "0x" + s if HEX.fullmatch(s) else None
+
+
+class Tracker:
+    def __init__(self, windows=None):
+        self.windows = windows if windows is not None else {}
+
+    def handle(self, line, now):
+        """Apply one event line; True when the state changed."""
+        event, sep, payload = line.decode("utf-8", "replace").partition(">>")
+        if not sep:
+            return False
+        if event == "closewindow":
+            addr = address(payload)
+            return addr is not None and self.windows.pop(addr, None) is not None
+        # windowtitlev2 carries the address, which windowtitle does not, and the address is
+        # the only stable way to tie a title to a window.
+        if event != "windowtitlev2":
+            return False
+        raw, _, title = payload.partition(",")
+        addr = address(raw)
+        if addr is None:
+            return False
+        title = title[:TITLE_MAX]
+        prev = self.windows.get(addr)
+        if prev is not None and prev["title"] == title:
+            return False
+        changes = min(prev["changes"] + 1, 1 << 31) if prev is not None else 1
+        self.windows[addr] = {"title": title, "changedAt": now, "changes": changes}
+        while len(self.windows) > WINDOWS_MAX:
+            del self.windows[min(self.windows, key=lambda a: self.windows[a]["changedAt"])]
+        return True
+
+
+def load_state():
+    """The previous session's windows, validated and capped; {} when absent or unusable."""
+    try:
+        raw = safe.read_json(STATE, STATE_MAX, default={}, max_depth=4, max_items=4096,
+                             max_string=4 * TITLE_MAX)
+    except (OSError, safe.UnsafeError):
+        return {}
+    windows = {}
+    for key, entry in (raw.items() if isinstance(raw, dict) else ()):
+        addr = address(key)
+        if addr is None or not isinstance(entry, dict) or not isinstance(entry.get("title"), str):
+            continue
+        changes = entry.get("changes")
+        windows[addr] = {"title": entry["title"][:TITLE_MAX],
+                         "changedAt": common.number(entry.get("changedAt")),
+                         "changes": changes if isinstance(changes, int) and not isinstance(changes, bool)
+                         and 0 <= changes < (1 << 31) else 0}
+    newest = sorted(windows, key=lambda a: windows[a]["changedAt"], reverse=True)[:WINDOWS_MAX]
+    return {a: windows[a] for a in newest}
 
 
 def socket_path():
-    runtime = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
-    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
-    if not sig:
-        base = pathlib.Path(runtime) / "hypr"
-        entries = sorted(base.glob("*/.socket2.sock"), key=lambda p: p.stat().st_mtime, reverse=True)
-        return str(entries[0]) if entries else ""
-    return f"{runtime}/hypr/{sig}/.socket2.sock"
+    base = os.path.join(safe.runtime_dir(), "hypr")
+    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
+    if sig:
+        candidates = [sig] if SIGNATURE.fullmatch(sig) else []
+    else:
+        try:
+            candidates = [name for name, st in safe.list_dir(base, max_entries=64)
+                          if stat.S_ISDIR(st.st_mode) and SIGNATURE.fullmatch(name)]
+        except (OSError, safe.UnsafeError):
+            candidates = []
+    found = []
+    for name in candidates:
+        if common.lstat_kind(os.path.join(base, name)) != stat.S_IFDIR:
+            continue
+        path = os.path.join(base, name, ".socket2.sock")
+        try:
+            st = os.stat(path, follow_symlinks=False)
+        except OSError:
+            continue
+        if stat.S_ISSOCK(st.st_mode) and st.st_uid == os.getuid():
+            found.append((st.st_mtime, path))
+    return max(found)[1] if found else None
 
 
 def already_running():
     try:
-        pid = int(LOCK.read_text().strip())
-    except Exception:
+        blob = safe.read_file(LOCK, 32)
+        pid = int((blob or b"").strip())
+    except (OSError, ValueError, safe.UnsafeError):
         return False
-    if pid == os.getpid():
+    if pid <= 0 or pid == os.getpid():
         return False
-    # A stale pid file outlives a crash; treat "no such process" as free.
-    return pathlib.Path(f"/proc/{pid}").is_dir()
+    # A stale pid file outlives a crash, and its pid may since belong to something else.
+    try:
+        if os.stat(f"/proc/{pid}").st_uid != os.getuid():
+            return False
+        cmdline = safe.read_system_file(f"/proc/{pid}/cmdline", 4096)
+    except (OSError, safe.UnsafeError):
+        return False
+    return bool(cmdline) and b"cockpit-agentd" in cmdline
+
+
+def release_lock():
+    try:
+        if (safe.read_file(LOCK, 32) or b"").strip() == str(os.getpid()).encode():
+            safe.remove_file(LOCK)
+    except (OSError, safe.UnsafeError):
+        pass
+
+
+def flush(tracker):
+    safe.write_json(STATE, tracker.windows)
+
+
+def watch(path):
+    tracker = Tracker(load_state())
+    dirty = False
+    # Windows closed while no daemon was running would otherwise linger until evicted.
+    clients = common.hypr_clients()
+    if clients is not None:
+        live = {c.get("address") for c in clients if isinstance(c, dict)}
+        before = len(tracker.windows)
+        tracker.windows = {a: w for a, w in tracker.windows.items() if a in live}
+        dirty = len(tracker.windows) != before
+    reader = LineReader()
+    last_flush = 0.0
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.connect(path)
+        # A timeout rather than a blocking read, so the last change before a quiet spell
+        # is still written within a second.
+        sock.settimeout(1.0)
+        try:
+            while True:
+                try:
+                    chunk = sock.recv(RECV_SIZE)
+                except TimeoutError:
+                    chunk = None
+                if chunk == b"":
+                    break   # Hyprland went away
+                if chunk:
+                    now = time.time()
+                    for line in reader.feed(chunk):
+                        dirty = tracker.handle(line, now) or dirty
+                # Batched: a spinner can fire several times a second and this file is read
+                # by a provider on a timer, not on every event.
+                if dirty and time.time() - last_flush >= FLUSH_EVERY:
+                    flush(tracker)
+                    dirty = False
+                    last_flush = time.time()
+        finally:
+            if dirty:
+                try:
+                    flush(tracker)
+                except (OSError, safe.UnsafeError):
+                    pass
+    return 0
 
 
 def main():
-    CACHE.mkdir(parents=True, exist_ok=True)
+    safe.die_with_parent()
+    signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(0))
     if already_running():
         print("cockpit-agentd: already running", file=sys.stderr)
         return 0
-    LOCK.write_text(str(os.getpid()))
-
-    path = socket_path()
-    if not path or not pathlib.Path(path).exists():
-        print(f"cockpit-agentd: no Hyprland event socket at {path!r}", file=sys.stderr)
-        return 1
-
-    state = {}
     try:
-        state = json.loads(STATE.read_text())
-    except Exception:
-        state = {}
-
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.connect(path)
-    buf = b""
-    dirty = False
-    last_flush = time.time()
-
-    def flush():
-        tmp = STATE.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(state))
-        tmp.replace(STATE)
-
-    while True:
-        chunk = sock.recv(8192)
-        if not chunk:
-            break
-        buf += chunk
-        while b"\n" in buf:
-            line, buf = buf.split(b"\n", 1)
-            text = line.decode("utf-8", "replace")
-            # windowtitlev2 carries the address, which windowtitle does not, and the
-            # address is the only stable way to tie a title to a window.
-            if not text.startswith("windowtitlev2>>"):
-                if text.startswith("closewindow>>"):
-                    state.pop("0x" + text.split(">>", 1)[1].strip().lstrip("0x"), None)
-                    dirty = True
-                continue
-            payload = text.split(">>", 1)[1]
-            addr, _, title = payload.partition(",")
-            addr = "0x" + addr.strip().removeprefix("0x")
-            prev = state.get(addr, {})
-            if prev.get("title") != title:
-                state[addr] = {"title": title, "changedAt": time.time(),
-                               "changes": int(prev.get("changes", 0)) + 1}
-                dirty = True
-        # Batched: a spinner can fire several times a second and this file is read by a
-        # provider on a timer, not on every event.
-        if dirty and (time.time() - last_flush) >= FLUSH_EVERY:
-            flush()
-            dirty = False
-            last_flush = time.time()
-
-    if dirty:
-        flush()
-    return 0
+        safe.ensure_dir(STATE_DIR)
+        safe.write_file(LOCK, f"{os.getpid()}\n")
+    except (OSError, safe.UnsafeError) as e:
+        print(f"cockpit-agentd: cannot write {LOCK}: {e}", file=sys.stderr)
+        return 1
+    try:
+        path = socket_path()
+        if not path:
+            print("cockpit-agentd: no Hyprland event socket", file=sys.stderr)
+            return 1
+        return watch(path)
+    except (OSError, safe.UnsafeError) as e:
+        print(f"cockpit-agentd: {e}", file=sys.stderr)
+        return 1
+    finally:
+        release_lock()
 
 
 if __name__ == "__main__":

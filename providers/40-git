@@ -1,71 +1,145 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Repos with uncommitted work or commits you never pushed.
 
 Scans a shallow set of roots rather than the whole home directory, because walking every
 directory looking for .git is slow enough to be felt. Roots come from
-~/.config/omarchy/cockpit/git-roots (one path per line) when it exists, otherwise the
-usual suspects.
+~/.config/omarchy/cockpit/git-roots (one path per line, at most 64 lines, each an absolute
+path or ~/path inside your home directory) when it exists, otherwise the usual suspects.
+
+A repository is untrusted data: git runs with hooks and the filesystem monitor off, every
+filter driver the repository defines blanked, no system config and no optional locks (see
+cockpit_common.git_hardening). The walk never follows a symlink.
 """
 import json
+import math
+import os
 import pathlib
-import subprocess
+import stat
+import sys
 import time
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "bin"))
+import plugin_safety as safe  # noqa: E402
+import cockpit_common as common  # noqa: E402
+
+HOME = common.HOME
 DEFAULT_ROOTS = ["~/Projects", "~/Work", "~/src", "~/dev", "~/.config/omarchy/plugins"]
-ROOTS_FILE = pathlib.Path.home() / ".config/omarchy/cockpit/git-roots"
+ROOTS_FILE = pathlib.Path(HOME) / ".config/omarchy/cockpit/git-roots"
+ROOTS_FILE_MAX = 16 * 1024
+ROOTS_LINES_MAX = 64
 DEPTH = 2
+REPOS_MAX = 200
+DIRS_VISITED_MAX = 20000
+DIR_ENTRIES_MAX = 4096
+STATUS_OUTPUT_MAX = 1024 * 1024
+# Inside the 20 s this provider declares, leaving room for interpreter start-up.
+DEADLINE = 17.0
 
 # Unpushed commits are always worth showing: that work exists on exactly one disk. A dirty
 # tree is different -- most stay dirty for years and are just how the repo lives. Measured
 # here: of 16 repos with changes, 15 had not been touched in over a month and several were
 # three years stale, so an unfiltered list was 94% archaeology.
 # Override with a number of days in ~/.config/omarchy/cockpit/dirty-within-days.
-DIRTY_WITHIN_DAYS_FILE = pathlib.Path.home() / ".config/omarchy/cockpit/dirty-within-days"
+DIRTY_WITHIN_DAYS_FILE = pathlib.Path(HOME) / ".config/omarchy/cockpit/dirty-within-days"
 DEFAULT_DIRTY_WITHIN_DAYS = 7
 # Stat at most this many changed files to date the work. A repo with 84 changes does not
 # need 84 stats to answer "was this touched recently".
 MTIME_SAMPLE = 25
 
 
+def expand(line):
+    if line == "~":
+        return HOME
+    if line.startswith("~/"):
+        return HOME + line[1:]
+    return line
+
+
 def roots():
-    if ROOTS_FILE.exists():
-        lines = [l.strip() for l in ROOTS_FILE.read_text().splitlines()]
-        chosen = [l for l in lines if l and not l.startswith("#")]
-        if chosen:
-            return chosen
-    return DEFAULT_ROOTS
-
-
-def git(repo, *args, timeout=4):
+    """(candidate roots, problem or None)."""
+    defaults = [expand(r) for r in DEFAULT_ROOTS]
     try:
-        r = subprocess.run(["git", "-C", str(repo), *args],
-                           capture_output=True, text=True, timeout=timeout)
-        return r.stdout.strip() if r.returncode == 0 else ""
-    except Exception:
-        return ""
+        blob = safe.read_file(ROOTS_FILE, ROOTS_FILE_MAX)
+    except (OSError, safe.UnsafeError) as e:
+        return defaults, f"git-roots ignored: {e}"
+    if blob is None:
+        return defaults, None
+    chosen = []
+    for line in blob.decode("utf-8", "replace").splitlines()[:ROOTS_LINES_MAX]:
+        line = line.strip()
+        if line and not line.startswith("#") and os.path.isabs(expand(line)):
+            chosen.append(expand(line))
+    return (chosen or defaults), None
 
 
-def find_repos():
-    found = []
-    for root in roots():
-        base = pathlib.Path(root).expanduser()
-        if not base.is_dir():
+def inside_home(path):
+    """The real path when it is a directory really inside $HOME, else None."""
+    real = os.path.realpath(path)
+    if common.home_path(real) is None or common.lstat_kind(real) != stat.S_IFDIR:
+        return None
+    return real
+
+
+def is_repo(path):
+    return common.lstat_kind(os.path.join(path, ".git")) == stat.S_IFDIR
+
+
+def find_repos(candidates):
+    found, visited = set(), 0
+    for root in candidates:
+        base = inside_home(root)
+        if base is None:
             continue
-        if (base / ".git").is_dir():
-            found.append(base)
+        if is_repo(base):
+            found.add(base)
             continue
-        for depth in range(1, DEPTH + 1):
-            for candidate in base.glob("/".join(["*"] * depth) + "/.git"):
-                if candidate.is_dir():
-                    found.append(candidate.parent)
-    return sorted(set(found))
+        level = [base]
+        for _ in range(DEPTH):
+            below = []
+            for directory in level:
+                if visited >= DIRS_VISITED_MAX:
+                    break
+                visited += 1
+                try:
+                    with os.scandir(directory) as it:
+                        for n, entry in enumerate(it):
+                            if n >= DIR_ENTRIES_MAX:
+                                break
+                            try:
+                                if entry.name == ".git" or not entry.is_dir(follow_symlinks=False):
+                                    continue
+                            except OSError:
+                                continue
+                            if is_repo(entry.path):
+                                found.add(entry.path)
+                            below.append(entry.path)
+                except OSError:
+                    continue
+            level = below
+    return sorted(found)[:REPOS_MAX]
 
 
 def dirty_within_days():
     try:
-        return max(0.0, float(DIRTY_WITHIN_DAYS_FILE.read_text().strip()))
-    except Exception:
+        value = float((safe.read_file(DIRTY_WITHIN_DAYS_FILE, 64) or b"").strip())
+    except (OSError, ValueError, safe.UnsafeError):
         return float(DEFAULT_DIRTY_WITHIN_DAYS)
+    return max(0.0, min(3650.0, value)) if math.isfinite(value) else float(DEFAULT_DIRTY_WITHIN_DAYS)
+
+
+def status(repo, budget):
+    """(porcelain text, partial) or None. Partial when the listing overran its cap."""
+    argv = common.git_command(repo, "status", "--porcelain", "--branch", "--ignore-submodules=dirty",
+                              timeout=min(4.0, budget))
+    if argv is None:
+        return None
+    try:
+        r = safe.run(argv, env=common.GIT_ENV, timeout=budget, max_output=STATUS_OUTPUT_MAX)
+    except (OSError, safe.UnsafeError):
+        return None
+    if r.timed_out or (r.returncode != 0 and not r.truncated):
+        return None
+    return r.text().strip(), r.truncated
 
 
 def newest_change(repo, entries):
@@ -75,9 +149,12 @@ def newest_change(repo, entries):
         name = line[3:].strip().strip('"')
         if " -> " in name:          # renames read "old -> new"
             name = name.split(" -> ")[-1]
+        path = os.path.normpath(os.path.join(repo, name))
+        if not path.startswith(repo + "/"):
+            continue
         try:
-            newest = max(newest, (repo / name).stat().st_mtime)
-        except Exception:
+            newest = max(newest, os.stat(path, follow_symlinks=False).st_mtime)
+        except OSError:
             continue
     return newest
 
@@ -94,39 +171,52 @@ def ago(seconds):
     return f"{days / 365:.0f}y ago"
 
 
+def branch_line(head):
+    branch, ahead, behind = "?", 0, 0
+    if head:
+        body = head[2:].strip()
+        name, _, track = body.partition("...")
+        branch = name.strip() or "?"
+        if "[" in track:
+            marks = track[track.index("[") + 1:].rstrip("]")
+            for part in marks.split(","):
+                words = part.split()
+                if len(words) == 2 and words[1].isdigit():
+                    if words[0] == "ahead":
+                        ahead = int(words[1])
+                    elif words[0] == "behind":
+                        behind = int(words[1])
+    return branch, ahead, behind
+
+
 def main():
-    rows = []
+    rows, notices = [], []
+    candidates, problem = roots()
+    if problem:
+        notices.append({"glyph": "󰊢", "title": "git-roots not used", "detail": problem, "state": "warn"})
     horizon = dirty_within_days()
-    now = time.time()
-    for repo in find_repos():
+    start = now = time.time()
+    for repo in find_repos(candidates):
+        remaining = DEADLINE - (time.time() - start)
+        if remaining < 1:
+            break
         # One call, not three: --branch makes the first line carry the branch and the
         # ahead/behind counts, and the rest is the dirty list. Three calls per repo across
         # a few dozen repos took 7.8s here, past the runner's timeout; this is ~1/3 of it.
-        out = git(repo, "status", "--porcelain", "--branch")
-        if not out:
+        result = status(repo, min(8.0, remaining))
+        if not result or not result[0]:
             continue
+        out, partial = result
         lines = out.splitlines()
         head = lines[0] if lines and lines[0].startswith("##") else ""
-        dirty_count = len([l for l in lines[1:] if l.strip()])
-
-        branch, ahead, behind = "?", 0, 0
-        if head:
-            body = head[2:].strip()
-            name, _, track = body.partition("...")
-            branch = name.strip() or "?"
-            if "[" in track:
-                marks = track[track.index("[") + 1:].rstrip("]")
-                for part in marks.split(","):
-                    part = part.strip()
-                    if part.startswith("ahead "):
-                        ahead = int(part.split()[1])
-                    elif part.startswith("behind "):
-                        behind = int(part.split()[1])
+        entries = [l for l in lines[1:] if l.strip()]
+        dirty_count = len(entries)
+        branch, ahead, behind = branch_line(head)
 
         if not dirty_count and not ahead:
             continue
 
-        changed_at = newest_change(repo, [l for l in lines[1:] if l.strip()]) if dirty_count else 0
+        changed_at = newest_change(repo, entries) if dirty_count else 0
         age = (now - changed_at) if changed_at else None
         # Unpushed always shows. Dirty-only has to be recent enough to still be on your mind.
         if not ahead and (age is None or age > horizon * 86400):
@@ -134,29 +224,32 @@ def main():
 
         bits = []
         if dirty_count:
-            bits.append(f"{dirty_count} changed")
+            bits.append(f"{dirty_count}{'+' if partial else ''} changed")
         if ahead:
             bits.append(f"{ahead} unpushed")
         if behind:
             bits.append(f"{behind} behind")
         if age is not None:
             bits.append(ago(age))
-        rows.append({
+        row = {
             "glyph": "󰊢",
-            "title": repo.name,
+            "title": os.path.basename(repo),
             "detail": f"{branch} · " + ", ".join(bits),
             "_ahead": ahead,
             "_age": age if age is not None else 0,
             "state": "warn" if ahead else "idle",
-            "action": f"omarchy-launch-floating-terminal-with-presentation git -C {repo} status",
-        })
+        }
+        action = common.action_or_none({"kind": "terminal", "argv": ["git", "-C", repo, "status"]})
+        if action:
+            row["action"] = action
+        rows.append(row)
     # Unpushed first, then whatever you touched most recently.
     rows.sort(key=lambda r: (r["_ahead"] == 0, r["_age"]))
     for r in rows:
         r.pop("_ahead", None)
         r.pop("_age", None)
     print(json.dumps({"section": "Git", "glyph": "󰊢", "priority": 40,
-                      "intervalSec": 120, "timeoutSec": 20, "rows": rows}, ensure_ascii=False))
+                      "intervalSec": 120, "timeoutSec": 20, "rows": notices + rows}, ensure_ascii=False))
 
 
 if __name__ == "__main__":

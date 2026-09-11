@@ -3,13 +3,50 @@
 // Pure display logic for the cockpit. No QML, no I/O.
 
 var DEFAULT_CAP = 6
+var RAW_MAX = 4 * 1024 * 1024     // the runner caps its document at 2 MB
+var SECTIONS_MAX = 64
+var ROWS_MAX = 200
+var TEXT_MAX = 1024
+var ACTION_MAX = 8 * 1024
+var LAUNCH_MAX = 16 * 1024
 
+function isObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+}
+
+function text(value, limit) {
+  if (typeof value !== "string" && typeof value !== "number") return ""
+  return String(value).slice(0, limit)
+}
+
+function rowsOf(section) {
+  return isObject(section) && Array.isArray(section.rows) ? section.rows.slice(0, ROWS_MAX) : []
+}
+
+// ok is false when the runner's output was unusable (killed by the watchdog, say), so
+// the panel can keep what it last showed instead of blanking.
 function parse(raw) {
+  var empty = { ok: false, sections: [], notes: {} }
+  if (typeof raw !== "string" || raw.length > RAW_MAX) return empty
   var doc = null
-  try { doc = JSON.parse(raw) } catch (e) { return { sections: [], notes: {} } }
-  if (!doc || typeof doc !== "object") return { sections: [], notes: {} }
-  var sections = Array.isArray(doc.sections) ? doc.sections : []
-  return { sections: sections, notes: doc.notes || {} }
+  try { doc = JSON.parse(raw) } catch (e) { return empty }
+  if (!isObject(doc)) return empty
+  var sections = Array.isArray(doc.sections) ? doc.sections.slice(0, SECTIONS_MAX).filter(isObject) : []
+  var notes = {}
+  if (isObject(doc.notes)) {
+    var names = Object.keys(doc.notes).slice(0, SECTIONS_MAX)
+    for (var i = 0; i < names.length; i++) notes[text(names[i], 64)] = text(doc.notes[names[i]], 300)
+  }
+  return { ok: true, sections: sections, notes: notes }
+}
+
+// Actions are structured objects the runner has already validated; the panel hands them
+// to `cockpit action` over stdin unchanged, and that helper validates them again. Anything
+// else -- an old shell-string action -- is simply not clickable.
+function actionJson(action) {
+  if (!isObject(action)) return ""
+  var s = JSON.stringify(action)
+  return s.length <= ACTION_MAX ? s : ""
 }
 
 // A section can legitimately return dozens of rows -- sixteen dirty repos is normal --
@@ -19,27 +56,28 @@ function flatten(sections, cap, expanded) {
   var out = []
   for (var i = 0; i < sections.length; i++) {
     var s = sections[i]
-    var rows = Array.isArray(s.rows) ? s.rows : []
+    var rows = rowsOf(s)
     if (rows.length === 0) continue
-    var open = !!(expanded && expanded[s.section])
-    out.push({ kind: "header", section: s.section, glyph: s.glyph || "",
+    var name = text(s.section, 64)
+    var open = !!(expanded && expanded[name])
+    out.push({ kind: "header", section: name, glyph: text(s.glyph, 16),
                count: rows.length, expanded: open })
     var shown = open ? rows.length : Math.min(rows.length, limit)
     for (var j = 0; j < shown; j++) {
-      var r = rows[j]
+      var r = isObject(rows[j]) ? rows[j] : {}
       out.push({
         kind: "row",
-        section: s.section,
-        glyph: String(r.glyph || ""),
-        title: String(r.title || ""),
-        detail: String(r.detail || ""),
-        state: String(r.state || "idle"),
+        section: name,
+        glyph: text(r.glyph, 16),
+        title: text(r.title, TEXT_MAX),
+        detail: text(r.detail, TEXT_MAX),
+        state: text(r.state, 8) || "idle",
         progress: typeof r.progress === "number" ? Math.max(0, Math.min(100, r.progress)) : -1,
-        action: String(r.action || "")
+        action: actionJson(r.action)
       })
     }
     if (rows.length > shown) {
-      out.push({ kind: "more", section: s.section, hidden: rows.length - shown })
+      out.push({ kind: "more", section: name, hidden: rows.length - shown })
     }
   }
   return out
@@ -51,10 +89,9 @@ function flatten(sections, cap, expanded) {
 function liveCount(sections) {
   var n = 0
   for (var i = 0; i < sections.length; i++) {
-    var s = sections[i]
-    var rows = Array.isArray(s.rows) ? s.rows : []
+    var rows = rowsOf(sections[i])
     for (var j = 0; j < rows.length; j++) {
-      if (rows[j].state === "busy") n++
+      if (isObject(rows[j]) && rows[j].state === "busy") n++
     }
   }
   return n
@@ -63,9 +100,8 @@ function liveCount(sections) {
 function summary(sections) {
   var parts = []
   for (var i = 0; i < sections.length; i++) {
-    var s = sections[i]
-    var rows = Array.isArray(s.rows) ? s.rows : []
-    if (rows.length) parts.push(rows.length + " " + String(s.section).toLowerCase())
+    var rows = rowsOf(sections[i])
+    if (rows.length) parts.push(rows.length + " " + text(sections[i].section, 64).toLowerCase())
   }
   return parts.length ? parts.join(" · ") : "Nothing in flight"
 }
@@ -77,4 +113,15 @@ function brokenNotes(notes) {
     if (note !== "ok" && note !== "cached") out.push(name + ": " + note)
   }
   return out
+}
+
+// `cockpit action` answers a terminal action with the argv to start detached (a terminal
+// must outlive the helper). Only that exact shape, for that exact program, is accepted.
+function terminalLaunch(raw, launcher) {
+  if (typeof raw !== "string" || raw.length === 0 || raw.length > LAUNCH_MAX) return null
+  var doc = null
+  try { doc = JSON.parse(raw) } catch (e) { return null }
+  if (!isObject(doc) || !Array.isArray(doc.exec) || doc.exec.length !== 2) return null
+  if (doc.exec[0] !== launcher || typeof doc.exec[1] !== "string" || doc.exec[1].length === 0) return null
+  return [doc.exec[0], doc.exec[1]]
 }

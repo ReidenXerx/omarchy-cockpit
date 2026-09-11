@@ -49,29 +49,55 @@ can be replaced without editing the plugin.
 
 ```json
 {
-  "section": "CI",
+  "section": "Work",
   "glyph": "󰜎",
   "priority": 35,
   "intervalSec": 60,
   "timeoutSec": 20,
   "rows": [
-    { "glyph": "󰄬", "title": "api-server", "detail": "3 checks passed",
-      "state": "ok", "progress": 100, "action": "xdg-open https://..." }
+    { "glyph": "󰊢", "title": "api-server", "detail": "3 files changed",
+      "state": "warn", "progress": 40,
+      "action": { "kind": "terminal", "argv": ["git", "-C", "/home/you/src/api-server", "status"] } }
   ]
 }
 ```
 
 `state` is `ok` · `busy` · `warn` · `idle` and only tints the row. `progress` draws a bar
-when present. `action` is a shell command run on click. `intervalSec` and `timeoutSec` are
-the provider's own budget — scanning repos or asking a mirror what is stale legitimately
-costs more than reading `/proc`, and the runner caches each provider separately so an
-expensive one is not re-run because a cheap one ticked.
+when present. `intervalSec` and `timeoutSec` are the provider's own budget — scanning repos
+or asking a mirror what is stale legitimately costs more than reading `/proc`, and the
+runner caches each provider separately so an expensive one is not re-run because a cheap
+one ticked.
 
-Anything else on stdout, a non-zero exit, or a timeout means that provider is skipped with
-a visible note. One broken provider never takes the hub down.
+**Actions are structured** (changed in 1.1 — before that `action` was a shell command
+line, and such strings are now ignored with a note in the hub). A click can do one of:
+
+| action | does |
+|---|---|
+| `{"kind": "focus-window", "address": "0x55d0c0ffee"}` | focuses that Hyprland window |
+| `{"kind": "terminal", "argv": [...]}` | runs the command in Omarchy's floating presentation terminal |
+| `{"kind": "run", "argv": [...]}` | runs the command in the background, with a deadline |
+
+`argv` is never given to a shell, and only these commands are accepted:
+
+| program | arguments |
+|---|---|
+| `git` | `-C <absolute path inside your home> status [--short, --branch, --porcelain, …]` |
+| `checkupdates` | none |
+| `yay`, `paru` | `-Qua` or `-Syu` |
+| `flatpak` | `update` or `remote-ls --updates` |
+| `tailscale` | `up` or `status` |
+| `ping` | `-c1 <host>` or `-c <1-9> <host>` |
+| `udisksctl` | `mount` or `unmount`, `-b /dev/<device>` |
+
+Anything else is dropped from the row (the rest of the row still shows).
+
+The runner's limits: 256 KB of output, 200 rows per section, 1 KB per string, 30 seconds.
+Anything else on stdout, a non-zero exit, a timeout or an overrun means that provider is
+skipped with a visible note, keeping its last good output. One broken provider never takes
+the hub down.
 
 ```bash
-bin/cockpit --list          # providers found, and where from
+bin/cockpit --list          # providers found, where from, and why one was skipped
 bin/cockpit --plain         # human-readable, for checking a provider's output
 bin/cockpit --only git      # run one, uncached
 ```
@@ -90,15 +116,43 @@ quiet during a long tool call. So `working` is trustworthy; `last active 4m` mea
 visible sign of life, not proof that nothing is happening. The label says so rather than
 claiming idleness.
 
+## Security
+
+- **No shell.** Helpers run as `/usr/bin/python3 <plugin>/bin/…`; every external program is
+  resolved to a root-owned binary in `/usr/bin` and run with `PATH=/usr/bin`, a deadline,
+  an output ceiling and a whole-process-group kill (`bin/plugin_safety.py`, shared with
+  the author's other plugins). The panel stops any helper that overruns.
+- **Clicks carry data, not commands.** A row action travels to `cockpit action` over stdin
+  (8 KB cap) and is checked against the allow-list above before anything runs. Window
+  addresses must be hex; hosts, devices and repo paths can only fill their own slot.
+- **Your providers must be yours.** A user provider is run only if it is a regular file you
+  own, not group- or other-writable, reached without symlinks; otherwise the hub says why
+  it was skipped.
+- **Repositories are untrusted.** Git runs with hooks and the filesystem monitor off, every
+  filter driver a repository defines blanked (a hostile `.git/config` can otherwise make
+  `git status` run a program), no system config and no optional locks. Git roots must
+  resolve inside your home, and the scan below a root never follows a symlink.
+- **Bounded input everywhere.** Provider output, the Hyprland event stream (8 KB per event,
+  64 KB buffered, 256-character titles, 256 windows), `hyprctl`/`tailscale`/`lsblk` JSON and
+  every state file are size- and structure-capped. Files are read and written without
+  following symlinks, through random temporary files and atomic renames.
+
 ## Configuration
 
 | file | effect |
 |---|---|
 | `~/.config/omarchy/cockpit/providers/` | your providers |
-| `~/.config/omarchy/cockpit/git-roots` | directories to scan for repos, one per line |
+| `~/.config/omarchy/cockpit/git-roots` | directories to scan for repos, one per line (first 64 lines; absolute or `~/` paths inside your home) |
 | `~/.config/omarchy/cockpit/dirty-within-days` | how recent a dirty tree must be to show (default 7) |
 
 Rows per section and refresh interval are in the widget's own settings.
+
+## Development
+
+```bash
+python3 tests/cockpit_test.py   # runner, actions, daemon, providers, hostile git repos
+node tests/model_test.js        # panel display logic
+```
 
 ## Remove
 
@@ -107,8 +161,9 @@ bin/cockpit-menu-install remove
 omarchy plugin remove reidenxerx.cockpit
 ```
 
-State lives in `~/.cache/omarchy-cockpit/` and can be deleted. The daemon stops with the
-shell; nothing else is left running.
+State lives in `$XDG_RUNTIME_DIR/omarchy-cockpit/` and is gone at logout. Version 1.0 kept
+it in `~/.cache/omarchy-cockpit/`, which is no longer used and can be deleted. The daemon
+stops with the shell; nothing else is left running.
 
 ## License
 

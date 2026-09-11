@@ -1,56 +1,83 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Which of your machines are reachable, and how.
 
 Only peers that are actually up are listed. A tailnet is mostly idle machines, and a row
 per sleeping laptop is the kind of always-true noise that makes a hub stop being read.
 """
+import ipaddress
 import json
-import shutil
-import subprocess
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "bin"))
+import plugin_safety as safe  # noqa: E402
+import cockpit_common as common  # noqa: E402
 
 OS_GLYPH = {"windows": "\U000f05b3", "linux": "\U000f033d", "android": "\U000f0032",
             "macOS": "\U000f0035", "iOS": "\U000f0035"}
+OUTPUT_MAX = 4 * 1024 * 1024
+PEERS_MAX = 256
+
+
+def status():
+    try:
+        r = safe.run(["tailscale", "status", "--json"], timeout=6, max_output=OUTPUT_MAX)
+        if not r.ok:
+            return {}
+        data = safe.loads(r.stdout, max_depth=16, max_items=200000, max_string=1 << 16)
+    except (OSError, ValueError, safe.UnsafeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def first_ip(values):
+    for value in values if isinstance(values, list) else []:
+        try:
+            return str(ipaddress.ip_address(value))
+        except ValueError:
+            continue
+    return None
+
+
+def rows_for(data):
+    rows = []
+    backend = data.get("BackendState")
+    if backend not in (None, "Running"):
+        rows.append({"glyph": "\U000f0a49", "title": "Tailscale " + common.clean_text(backend, 32),
+                     "detail": "not connected", "state": "warn",
+                     "action": {"kind": "run", "argv": ["tailscale", "up"]}})
+        return rows
+    peers = data.get("Peer")
+    for peer in list(peers.values())[:PEERS_MAX] if isinstance(peers, dict) else []:
+        if not isinstance(peer, dict) or not peer.get("Online"):
+            continue
+        name = common.clean_text(peer.get("HostName", "?"), 128)
+        os_name = common.clean_text(peer.get("OS", ""), 32)
+        # Direct means a peer-to-peer path; a relayed link is slower and worth
+        # distinguishing when you are about to stream a desktop over it.
+        relay = common.clean_text(peer.get("Relay") or "", 32)
+        path = "direct" if peer.get("CurAddr") else (f"relay {relay}" if relay else "idle")
+        total = (common.number(peer.get("RxBytes")) + common.number(peer.get("TxBytes"))) / (1024 * 1024)
+        traffic = f" · {total:.0f}MB" if total >= 1 else ""
+        row = {
+            "glyph": OS_GLYPH.get(os_name, "\U000f033d"),
+            "title": name,
+            "detail": f"{os_name} · {path}{traffic}",
+            "state": "busy" if peer.get("CurAddr") else "idle",
+        }
+        ip = first_ip(peer.get("TailscaleIPs"))
+        action = common.action_or_none({"kind": "run", "argv": ["ping", "-c1", ip]}) if ip else None
+        if action:
+            row["action"] = action
+        rows.append(row)
+    rows.sort(key=lambda r: (r["state"] != "busy", r["title"]))
+    return rows
 
 
 def main():
-    rows = []
-    if shutil.which("tailscale"):
-        try:
-            r = subprocess.run(["tailscale", "status", "--json"],
-                               capture_output=True, text=True, timeout=6)
-            data = json.loads(r.stdout) if r.returncode == 0 else {}
-        except Exception:
-            data = {}
-
-        if data.get("BackendState") not in (None, "Running"):
-            rows.append({"glyph": "\U000f0a49", "title": "Tailscale " + str(data.get("BackendState")),
-                         "detail": "not connected", "state": "warn",
-                         "action": "tailscale up"})
-        else:
-            for peer in (data.get("Peer") or {}).values():
-                if not peer.get("Online"):
-                    continue
-                name = str(peer.get("HostName", "?"))
-                os_name = str(peer.get("OS", ""))
-                # Direct means a peer-to-peer path; a relayed link is slower and worth
-                # distinguishing when you are about to stream a desktop over it.
-                relay = peer.get("Relay") or ""
-                path = "direct" if peer.get("CurAddr") else (f"relay {relay}" if relay else "idle")
-                rx, tx = int(peer.get("RxBytes", 0)), int(peer.get("TxBytes", 0))
-                traffic = ""
-                if rx or tx:
-                    total = (rx + tx) / (1024 * 1024)
-                    traffic = f" · {total:.0f}MB" if total >= 1 else ""
-                rows.append({
-                    "glyph": OS_GLYPH.get(os_name, "\U000f033d"),
-                    "title": name,
-                    "detail": f"{os_name} · {path}{traffic}",
-                    "state": "busy" if peer.get("CurAddr") else "idle",
-                    "action": f"ping -c1 {peer.get('TailscaleIPs', ['?'])[0]}" if peer.get("TailscaleIPs") else "",
-                })
-    rows.sort(key=lambda r: (r["state"] != "busy", r["title"]))
+    rows = rows_for(status()) if safe.has_tool("tailscale") else []
     print(json.dumps({"section": "Tailnet", "glyph": "\U000f0a49", "priority": 70,
-                      "intervalSec": 20, "rows": rows}, ensure_ascii=False))
+                      "intervalSec": 20, "timeoutSec": 10, "rows": rows}, ensure_ascii=False))
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Whether a reboot is owed, and why.
 
 On Arch the running kernel and the installed one drift apart silently after an update,
@@ -11,19 +11,28 @@ Silent when there is nothing to report, which is most of the time.
 import json
 import os
 import pathlib
-import subprocess
+import stat
+import sys
+import time
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "bin"))
+import plugin_safety as safe  # noqa: E402
+import cockpit_common as common  # noqa: E402
 
 # Packages whose update is only actually in effect after a reboot.
 CRITICAL = ("linux", "linux-lts", "linux-zen", "nvidia", "nvidia-open", "nvidia-dkms",
             "systemd", "intel-ucode", "amd-ucode", "mesa")
+PACMAN_LOCAL = "/var/lib/pacman/local"
+LOCAL_ENTRIES_MAX = 50000
 
 
 def pacman_version(pkg):
     try:
-        r = subprocess.run(["pacman", "-Q", pkg], capture_output=True, text=True, timeout=4)
-        return r.stdout.split()[1] if r.returncode == 0 else ""
-    except Exception:
+        r = safe.run(["pacman", "-Q", pkg], timeout=4, max_output=4096)
+    except (OSError, safe.UnsafeError):
         return ""
+    parts = r.text().split()
+    return parts[1] if r.ok and len(parts) >= 2 else ""
 
 
 def normalise(v):
@@ -32,34 +41,39 @@ def normalise(v):
     return "".join(ch for ch in v if ch.isalnum())
 
 
-def boot_time():
+def installed_at(packages):
+    """{pkg: newest install time} from pacman's local database, whose entries are named
+    <name>-<version>-<rel>. Directory metadata only; nothing is read or followed."""
+    newest = dict.fromkeys(packages, 0.0)
     try:
-        with open("/proc/uptime") as f:
-            return float(f.read().split()[0])
-    except Exception:
-        return 0.0
+        with os.scandir(PACMAN_LOCAL) as it:
+            for n, entry in enumerate(it):
+                if n >= LOCAL_ENTRIES_MAX:
+                    break
+                for pkg in packages:
+                    # "nvidia-utils-580..." is not "nvidia": a version starts with a digit.
+                    if entry.name.startswith(pkg + "-") and entry.name[len(pkg) + 1:][:1].isdigit():
+                        try:
+                            st = entry.stat(follow_symlinks=False)
+                        except OSError:
+                            continue
+                        if stat.S_ISDIR(st.st_mode):
+                            newest[pkg] = max(newest[pkg], st.st_mtime)
+    except OSError:
+        pass
+    return newest
 
 
 def main():
-    import time
     running = os.uname().release
     installed = pacman_version("linux")
-    up = boot_time()
+    up = common.uptime()
 
     kernel_stale = bool(installed) and normalise(installed) not in normalise(running)
 
-    stale_pkgs = []
-    for pkg in CRITICAL:
-        if pkg == "linux":
-            continue
-        try:
-            newest = max((d.stat().st_mtime for d in
-                          pathlib.Path("/var/lib/pacman/local").glob(f"{pkg}-*") if d.is_dir()),
-                         default=0)
-        except Exception:
-            newest = 0
-        if newest and (time.time() - newest) < up:
-            stale_pkgs.append(pkg)
+    now = time.time()
+    stamps = installed_at([p for p in CRITICAL if p != "linux"])
+    stale_pkgs = [pkg for pkg, at in stamps.items() if at and up and (now - at) < up]
 
     rows = []
     if kernel_stale or stale_pkgs:
@@ -78,7 +92,7 @@ def main():
         })
 
     print(json.dumps({"section": "Reboot", "glyph": "󰜉", "priority": 5,
-                      "intervalSec": 300, "rows": rows}, ensure_ascii=False))
+                      "intervalSec": 300, "timeoutSec": 6, "rows": rows}, ensure_ascii=False))
 
 
 if __name__ == "__main__":
