@@ -11,6 +11,7 @@ import json
 import pathlib
 import sys
 
+sys.dont_write_bytecode = True  # no __pycache__ in the plugin (the shell watches it)
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "bin"))
 import plugin_safety as safe  # noqa: E402
 import cockpit_common as common  # noqa: E402
