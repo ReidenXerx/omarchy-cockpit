@@ -1,5 +1,7 @@
 # Cockpit
 
+![Cockpit](preview.png)
+
 An [Omarchy](https://omarchy.org) bar widget: one hub for **what the machine is doing right
 now**, so you stop switching workspaces to find out.
 
