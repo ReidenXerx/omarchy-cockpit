@@ -4,8 +4,9 @@
 Claude Code keeps a status record for every running session in
 ~/.claude/sessions/<pid>.json: "busy" for the whole of a turn, tool calls included;
 "waiting" when something needs you -- a question, a permission or other dialog, a sandbox
-request -- with the reason in `waitingFor`; and "idle" once it is done. That record is
-the truth for those sessions. It is tied to a window by walking up from the session's
+request -- with the reason in `waitingFor`; "shell" when the turn is over but a
+background command it started is still running; and "idle" once it is done. That record
+is the truth for those sessions. It is tied to a window by walking up from the session's
 process to the one that owns a Hyprland window, and a record is trusted only while its
 pid still names the process that wrote it (the start time must match).
 
@@ -39,7 +40,9 @@ SESSION_FILE_MAX = 16 * 1024
 SESSION_LIMITS = {"max_depth": 4, "max_items": 256, "max_string": 4096}
 SESSION_FILE = re.compile(r"([1-9][0-9]{0,9})\.json")
 PROC_START = re.compile(r"[0-9]{1,20}")
-STATUSES = ("busy", "waiting", "idle")
+# A status is a short lowercase word. Ones this provider does not know yet are shown as
+# written rather than dropped: a session vanishing from the hub is worse than a plain label.
+STATUS_WORD = re.compile(r"[a-z][a-z_]{0,23}")
 PARENT_DEPTH = 32
 # What Claude Code puts in front of its terminal title: two glyphs that alternate while it
 # animates and one while it is still. Used to pick its window out of several that belong
@@ -168,7 +171,7 @@ def parse_session(raw, pid):
     if not isinstance(proc_start, str) or not PROC_START.fullmatch(proc_start):
         return None
     status = raw.get("status")
-    if status not in STATUSES:
+    if not isinstance(status, str) or not STATUS_WORD.fullmatch(status):
         return None   # an older Claude Code without status: its title still shows it
     kind = raw.get("kind")
     return {
@@ -210,13 +213,21 @@ def read_sessions():
 def session_row(session, window, now):
     since = session["since"]
     age = elapsed(int(now - since)) if 0 < since <= now else ""
-    if session["status"] == "waiting":
+    for_age = f" for {age}" if age else ""
+    status = session["status"]
+    if status == "waiting":
         reason = session["needs"] or WAITING_FOR.get(session["waitingFor"], session["waitingFor"])
         glyph, state, label = "●", "needs", "needs you" + (f": {reason}" if reason else "")
-    elif session["status"] == "busy":
-        glyph, state, label = "◐", "busy", "working" + (f" for {age}" if age else "")
+    elif status == "busy":
+        glyph, state, label = "◐", "busy", "working" + for_age
+    elif status == "shell":
+        # The turn is over, but a background command the session started is still running.
+        # Claude Code counts that as working, and something is in motion, so it is busy.
+        glyph, state, label = "◐", "busy", "working in background" + for_age
+    elif status == "idle":
+        glyph, state, label = "✳", "idle", "idle" + for_age
     else:
-        glyph, state, label = "✳", "idle", "idle" + (f" for {age}" if age else "")
+        glyph, state, label = "✳", "idle", status.replace("_", " ") + for_age
 
     title = ""
     if window is not None:

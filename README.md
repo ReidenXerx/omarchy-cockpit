@@ -118,7 +118,9 @@ Cockpit reads those records (read-only) and shows:
 | waiting on a permission or other dialog | **needs you: prompt open**, or the choice itself when the session names it |
 | sandbox or worker request | **needs you: sandbox request** / **worker request** |
 | turn in progress | **working for 3m** |
+| turn over, a background command it started still running | **working in background for 3m** |
 | done | **idle for 12m** |
+| a status newer than this version knows | shown as written, e.g. **compacting for 1m** |
 
 Each session is tied to its window by walking up from its process to the one that owns a
 Hyprland window, so a click jumps to the right terminal. When one terminal process owns

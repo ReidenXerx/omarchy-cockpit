@@ -661,6 +661,19 @@ class Agents(Sandbox):
         self.session(status="busy", kind="background")
         self.assertIn("· background ·", self.rows()[0]["detail"])
 
+    def test_a_background_command_counts_as_working_and_new_statuses_are_shown_as_written(self):
+        # Claude Code writes "shell" when the turn is over but a background command it
+        # started is still running (observed live, not only in its source).
+        self.session(status="shell", age=65)
+        self.window()
+        row = self.rows()[0]
+        self.assertEqual((row["glyph"], row["state"], row["detail"]),
+                         ("◐", "busy", "working in background for 1m · ws3 · Claude"))
+        self.session(status="compacting_context", age=65)
+        row = self.rows()[0]
+        self.assertEqual((row["state"], row["detail"]), ("idle", "compacting context for 1m · ws3 · Claude"))
+        self.assertIn("action", row)
+
     def test_stale_foreign_or_malformed_records_are_not_sessions(self):
         done = subprocess.Popen(["/usr/bin/true"])
         done.wait()
@@ -670,7 +683,9 @@ class Agents(Sandbox):
                 json.dumps({"pid": self.sleeper.pid, "procStart": self.start_time(self.sleeper.pid), "status": "busy"})),
             "exited process": lambda: (self.sessions / f"{done.pid}.json").write_text(
                 json.dumps({"pid": done.pid, "procStart": "1", "status": "busy"})),
-            "unknown status": lambda: self.session(status="sleeping"),
+            "malformed status": lambda: self.session(status="Busy; rm -rf ~"),
+            "status that is not a string": lambda: self.session(status=5),
+            "missing status": lambda: self.session(status=None),
             "boolean pid": lambda: (self.sessions / "1.json").write_text(json.dumps({"pid": True, "procStart": "1", "status": "busy"})),
             "malformed": lambda: (self.sessions / f"{self.sleeper.pid}.json").write_text("{nope"),
             "oversized": lambda: self.session(pad="x" * self.agents.SESSION_FILE_MAX),
