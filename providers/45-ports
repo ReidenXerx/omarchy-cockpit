@@ -1,0 +1,256 @@
+#!/usr/bin/python3
+"""Which ports are taken right now, and by what.
+
+The question comes up when a dev server will not start ("address already in use"), when a
+server from yesterday is still running, or when you wonder whether something is reachable
+from other machines. `ss -H -ltnup` lists every TCP and UDP listener and names the process
+behind each one that is yours. Such a process gets a row of its own -- its ports, whether
+other machines can reach them or only this one, how long it has been up -- with a button to
+open a TCP port in the browser and one to stop it. A listener of the system or of another
+user carries no process for an unprivileged `ss`, so those are summed up in one line.
+
+A listener is "local only" when it is bound to a loopback address; a wildcard, a LAN or a
+VPN address is reachable from other machines. Multicast group memberships (a browser's mDNS
+on 224.0.0.251:5353) are not ports anyone connects to, and are left out.
+"""
+import ipaddress
+import json
+import os
+import pathlib
+import re
+import sys
+
+sys.dont_write_bytecode = True  # no __pycache__ in the plugin (the shell watches it)
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "bin"))
+import plugin_safety as safe  # noqa: E402
+import cockpit_common as common  # noqa: E402
+
+GLYPH_NETWORK = "\U000f0318"   # md-lan_connect
+GLYPH_LOCAL = "\U000f048d"     # md-server_network
+GLYPH_OPEN = "\U000f03cc"      # md-open_in_new
+GLYPH_STOP = "\U000f0666"      # md-stop_circle_outline
+OUTPUT_MAX = 1024 * 1024
+LINES_MAX = 2048
+OWNERS_MAX = 16
+ROWS_MAX = 64
+PORTS_SHOWN = 6
+SYSTEM_PORTS_SHOWN = 10
+NAME_MAX = 40
+CMDLINE_MAX = 16 * 1024
+# ss prints every process holding a socket as ("name",pid=N,fd=M).
+OWNER = re.compile(r'\("([^"]*)",pid=([0-9]{1,10}),fd=[0-9]{1,10}\)')
+# Interpreters whose name says little on its own: the script they run is the useful part.
+INTERPRETERS = {"node", "nodejs", "python", "python3", "java", "ruby", "bun", "deno", "perl", "php"}
+# Launchers in front of the script that matters: `node npx-cli.js vite` is vite.
+LAUNCHERS = {"npm-cli", "npx-cli", "pnpm", "yarn", "tsx", "ts-node"}
+SCRIPT_SUFFIXES = (".js", ".mjs", ".cjs", ".ts", ".py", ".jar", ".rb", ".pl", ".php")
+# Code given on the command line has no name worth showing.
+INLINE = {"-c", "-e", "--eval", "-p", "--print"}
+# A browser reaches a port bound to any of these at 127.0.0.1; one bound to ::1 only at [::1].
+OPEN_ON_V4 = {"127.0.0.1", "0.0.0.0", "*", "::"}
+
+
+def clock_ticks():
+    try:
+        return os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError):
+        return 100
+
+
+def split_address(text):
+    """(host, port) from ss's host:port -- IPv6 in brackets, an optional %scope -- or None.
+    A v4-mapped IPv6 address is given as the IPv4 address it maps."""
+    host, sep, port = text.rpartition(":")
+    if not sep or not port.isdigit() or not 0 < int(port) <= 65535:
+        return None
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    host = host.split("%", 1)[0]
+    if host in ("*", ""):
+        return "*", int(port)
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return None
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return str(ip), int(port)
+
+
+def reach(host):
+    """"local", "network" or "multicast" for the host a listener is bound to."""
+    if host == "*":
+        return "network"
+    ip = ipaddress.ip_address(host)
+    if ip.is_multicast:
+        return "multicast"
+    return "local" if ip.is_loopback else "network"
+
+
+def listeners(text):
+    """Every usable TCP and UDP listener in `ss -H -ltnup` output."""
+    found = []
+    for line in text.splitlines()[:LINES_MAX]:
+        # netid, state, recv-q, send-q, local, peer, then the processes -- whose names may hold spaces.
+        parts = line.split(None, 6)
+        if len(parts) < 6 or parts[0] not in ("tcp", "udp"):
+            continue
+        address = split_address(parts[4])
+        if address is None:
+            continue
+        where = reach(address[0])
+        if where == "multicast":
+            continue
+        owners = [(name, int(pid)) for name, pid in OWNER.findall(parts[6])[:OWNERS_MAX]] if len(parts) == 7 else []
+        found.append({"proto": parts[0], "host": address[0], "port": address[1], "reach": where, "owners": owners})
+    return found
+
+
+def owned(pid, uid, cache):
+    if pid not in cache:
+        try:
+            cache[pid] = 1 < pid <= common.PID_MAX and os.stat(f"/proc/{pid}").st_uid == uid
+        except OSError:
+            cache[pid] = False
+    return cache[pid]
+
+
+def clean_hint(arg):
+    name = os.path.basename(arg.rstrip("/"))
+    for suffix in SCRIPT_SUFFIXES:
+        if name.endswith(suffix) and len(name) > len(suffix):
+            name = name[:-len(suffix)]
+            break
+    return common.clean_text(name, 32)
+
+
+def script_hint(cmdline):
+    """What an interpreter runs, from its command line: `python3 -m http.server` is http.server,
+    `node /x/node_modules/.bin/vite` is vite."""
+    args = [a for a in cmdline.split("\0") if a][1:32]
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in INLINE:
+            return ""
+        if arg in ("-m", "-jar") and i + 1 < len(args):
+            return clean_hint(args[i + 1])
+        if not arg.startswith("-"):
+            name = clean_hint(arg)
+            if name not in LAUNCHERS or i + 1 >= len(args):
+                return name
+        i += 1
+    return ""
+
+
+def process_title(pid, fallback):
+    """The process's own name (ss's copy is only a fallback), with the script for an interpreter."""
+    comm = (common.proc_read(pid, "comm", 64) or fallback or "").strip() or "?"
+    base = comm.split("-", 1)[0]   # node names its main thread "node-MainThread"
+    if base.lower() not in INTERPRETERS:
+        return common.clean_text(comm, NAME_MAX)
+    hint = script_hint(common.proc_read(pid, "cmdline", CMDLINE_MAX) or "")
+    return common.clean_text(f"{base} · {hint}" if hint else base, NAME_MAX)
+
+
+def running_for(start, hz, up):
+    if start is None or hz <= 0 or up <= 0:
+        return ""
+    age = up - int(start) / hz
+    if age < 0:
+        return ""
+    if age < 60:
+        return f"up {int(age)}s"
+    if age < 3600:
+        return f"up {int(age // 60)}m"
+    if age < 86400:
+        return f"up {int(age // 3600)}h"
+    return f"up {int(age // 86400)}d"
+
+
+def port_list(ports, shown):
+    text = ", ".join(str(p) for p in ports[:shown])
+    return text + (f" +{len(ports) - shown}" if len(ports) > shown else "")
+
+
+def url_host(hosts):
+    """Where a browser on this machine reaches a TCP port, or None when it is bound only to an address
+    open-url does not take (a LAN or VPN address, 127.0.0.53)."""
+    if hosts & OPEN_ON_V4:
+        return "127.0.0.1"
+    if "::1" in hosts:
+        return "[::1]"
+    return None
+
+
+def system_row(system):
+    bits = [f"{proto} {port_list(sorted(system[proto]), SYSTEM_PORTS_SHOWN)}" for proto in ("tcp", "udp") if system[proto]]
+    if not bits:
+        return None
+    return {"glyph": GLYPH_LOCAL, "title": "System services", "detail": " · ".join(bits), "state": "idle"}
+
+
+def rows_for(found, uid, up, hz):
+    cache, processes = {}, {}
+    system = {"tcp": set(), "udp": set()}
+    for listener in found:
+        mine = sorted({pid for _, pid in listener["owners"] if owned(pid, uid, cache)})
+        if not mine:
+            system[listener["proto"]].add(listener["port"])
+            continue
+        # A socket shared with forked children is put on the lowest pid, usually their parent.
+        pid = mine[0]
+        fallback = next((name for name, p in listener["owners"] if p == pid), "")
+        entry = processes.setdefault(pid, {"name": fallback, "tcp": {}, "udp": {}, "network": False})
+        entry[listener["proto"]].setdefault(listener["port"], set()).add(listener["host"])
+        entry["network"] = entry["network"] or listener["reach"] == "network"
+
+    ranked = []
+    for pid, entry in processes.items():
+        title = process_title(pid, entry["name"])
+        start = common.proc_start(pid)
+        tcp, udp = sorted(entry["tcp"]), sorted(entry["udp"])
+        bits = ([f"tcp {port_list(tcp, PORTS_SHOWN)}"] if tcp else []) + ([f"udp {port_list(udp, PORTS_SHOWN)}"] if udp else [])
+        bits.append("reachable on your network" if entry["network"] else "local only")
+        up_text = running_for(start, hz, up)
+        if up_text:
+            bits.append(up_text)
+        row = {"glyph": GLYPH_NETWORK if entry["network"] else GLYPH_LOCAL, "title": title,
+               "detail": " · ".join(bits), "state": "idle"}
+        buttons = []
+        for port in tcp:
+            host = url_host(entry["tcp"][port])
+            action = common.action_or_none({"kind": "open-url", "url": f"http://{host}:{port}/"}) if host else None
+            if action:
+                buttons.append({"glyph": GLYPH_OPEN, "label": f"Open localhost:{port} in the browser", "action": action})
+                break
+        stop = common.action_or_none({"kind": "stop-process", "pid": pid, "start": start}) if start else None
+        if stop:
+            buttons.append({"glyph": GLYPH_STOP, "label": f"Stop {title}", "confirm": f"Stop {title} (pid {pid})?",
+                            "action": stop})
+        if buttons:
+            row["buttons"] = buttons
+        ranked.append((not entry["network"], title.lower(), pid, row))
+    # What other machines can reach first: that is the part worth a second look.
+    ranked.sort(key=lambda item: item[:3])
+    rows = [item[3] for item in ranked][:ROWS_MAX - 1]
+    summary = system_row(system)
+    if summary:
+        rows.append(summary)
+    return rows
+
+
+def main():
+    rows = []
+    try:
+        r = safe.run(["ss", "-H", "-ltnup"], timeout=4, max_output=OUTPUT_MAX) if safe.has_tool("ss") else None
+    except (OSError, safe.UnsafeError):
+        r = None
+    if r is not None and r.ok:
+        rows = rows_for(listeners(r.text()), os.getuid(), common.uptime(), clock_ticks())
+    print(json.dumps({"section": "Ports", "glyph": GLYPH_NETWORK, "priority": 45, "intervalSec": 10,
+                      "timeoutSec": 8, "rows": rows}, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

@@ -28,6 +28,7 @@ sys.dont_write_bytecode = True   # never leave __pycache__ inside the plugin
 sys.path.insert(0, str(BIN))
 import plugin_safety as safe  # noqa: E402
 import cockpit_common as common  # noqa: E402
+import cockpit_agents  # noqa: E402
 
 
 def load(path, name):
@@ -233,7 +234,8 @@ class Runner(Sandbox):
         """The read-only shipped providers through the real runner, with the runtime
         directory (and so every state file) redirected into the sandbox."""
         (self.root / "hypr").symlink_to(pathlib.Path(safe.runtime_dir()) / "hypr")
-        names = ("05-reboot", "10-agents", "20-transfers", "30-jobs", "60-dgpu", "70-tailscale", "80-disk")
+        names = ("05-reboot", "10-agents", "20-transfers", "30-jobs", "45-ports", "60-dgpu", "70-tailscale",
+                 "72-network", "75-devices", "80-disk")
         with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(self.root)}):
             mock.patch.object(cockpit, "BUILTIN_DIR", ROOT / "providers").start()
             mock.patch.object(cockpit, "BUILTIN_PROVIDERS",
@@ -481,6 +483,11 @@ class Daemon(Sandbox):
         super().setUp()
         mock.patch.object(agentd, "STATE", self.root / "agent-state.json").start()
         mock.patch.object(agentd, "LOCK", self.root / "agentd.pid").start()
+        mock.patch.object(agentd, "STATE_DIR", self.root).start()
+        # The session side reads no real records, asks for no real focus and keeps its history in the sandbox.
+        mock.patch.object(common, "HOME", str(self.root)).start()
+        mock.patch.object(cockpit_agents, "read_sessions", lambda: []).start()
+        mock.patch.object(agentd, "initial_focus", lambda: None).start()
 
     def test_line_reader_bounds(self):
         r = agentd.LineReader(line_max=16, buffer_max=64)
@@ -506,6 +513,17 @@ class Daemon(Sandbox):
             self.assertFalse(t.handle(bad, 4.0), bad)
         self.assertTrue(t.handle(b"closewindow>>55aa", 5.0))
         self.assertEqual(t.windows, {})
+        self.assertTrue(t.windows_moved)
+        t.windows_moved = False
+        self.assertFalse(t.handle(b"openwindow>>55cc,1,foot,a title", 6.0))
+        self.assertTrue(t.windows_moved)
+        # Hyprland 0.56 names the focused window in bare hex, and sends nothing when focus leaves every window.
+        self.assertFalse(t.handle(b"activewindowv2>>55bb524d4800", 7.0))
+        self.assertEqual(t.focused, "0x55bb524d4800")
+        self.assertFalse(t.handle(b"activewindowv2>>", 8.0))
+        self.assertIsNone(t.focused)
+        self.assertFalse(t.handle(b"activewindowv2>>not an address", 9.0))
+        self.assertIsNone(t.focused)
 
     def test_tracker_cap_evicts_least_recently_changed(self):
         t = agentd.Tracker()
@@ -562,13 +580,36 @@ class Daemon(Sandbox):
                 conn.sendall("windowtitlev2>>abc,⠋ working\n".encode())
                 conn.sendall(b"windowtitlev2>>def," + b"q" * 20000 + b"\n")
                 conn.sendall(b"openwindow>>x,y\n" + "windowtitlev2>>abc,⠙ working\n".encode())
+                conn.sendall(b"activewindowv2>>abc\n")
 
         threading.Thread(target=serve, daemon=True).start()
         mock.patch.object(common, "hypr_clients", lambda: None).start()
-        self.assertEqual(agentd.watch(path), 0)
+        trackers, notifiers = [], []
+        real_tracker, real_notifier = agentd.Tracker, agentd.Notifier
+        mock.patch.object(agentd, "Tracker",
+                          lambda windows=None: trackers.append(real_tracker(windows)) or trackers[-1]).start()
+        mock.patch.object(agentd, "Notifier", lambda **kw: notifiers.append(kw) or real_notifier(**kw)).start()
+        self.assertEqual(agentd.watch(path, alerts=False), 0)
         state = json.loads((self.root / "agent-state.json").read_text())
         self.assertEqual(list(state), ["0xabc"])
         self.assertEqual(state["0xabc"]["changes"], 2)
+        self.assertEqual(trackers[0].focused, "0xabc")
+        self.assertEqual(notifiers, [{"enabled": False}])
+
+    def test_only_no_alerts_is_an_argument_and_it_turns_alerts_off(self):
+        started = []
+        mock.patch.object(safe, "die_with_parent", lambda: started.append("die")).start()
+        mock.patch.object(agentd.signal, "signal", lambda *args: None).start()
+        mock.patch.object(agentd, "socket_path", lambda: str(self.root / "hypr.sock")).start()
+        mock.patch.object(agentd, "watch", lambda path, alerts=True: started.append(alerts) or 0).start()
+        with contextlib.redirect_stderr(io.StringIO()) as said:
+            self.assertEqual(agentd.main(["--bogus"]), 2)
+            self.assertEqual(agentd.main(["--no-alerts", "--verbose"]), 2)
+        self.assertEqual(said.getvalue().count(agentd.USAGE), 2)
+        self.assertEqual(started, [])
+        self.assertEqual(agentd.main(["--no-alerts"]), 0)
+        self.assertEqual(agentd.main([]), 0)
+        self.assertEqual(started, ["die", False, "die", True])
 
 
 # ------------------------------------------------------------------ agents
@@ -582,9 +623,12 @@ class Agents(Sandbox):
         self.agents = load(ROOT / "providers" / "10-agents", "provider_agents")
         self.sessions = self.root / "claude-sessions"
         self.sessions.mkdir(mode=0o700)
-        mock.patch.object(self.agents, "CLAUDE_SESSIONS", self.sessions).start()
+        mock.patch.object(cockpit_agents, "CLAUDE_SESSIONS", self.sessions).start()
         mock.patch.object(self.agents, "SEEN", self.root / "agent-titles.json").start()
         mock.patch.object(self.agents, "LIVE", self.root / "agent-state.json").start()
+        # Home is the sandbox: no real history is read, and a project can live in it.
+        mock.patch.object(common, "HOME", str(self.root)).start()
+        self.glyph = self.agents.STATUS_GLYPHS
         self.clients = []
         mock.patch.object(common, "hypr_clients", lambda: self.clients).start()
         self.sleeper = self.spawn()
@@ -624,8 +668,27 @@ class Agents(Sandbox):
         self.session(status="busy")
         self.window()   # owned by this process, the sleeper's parent
         self.assertEqual(self.rows(), [{
-            "glyph": "◐", "title": "Fix the flaky test", "detail": "working for 2m · ws3 · Claude",
+            "glyph": self.glyph["busy"], "title": "Fix the flaky test", "detail": "working for 2m · ws3",
             "state": "busy", "action": {"kind": "focus-window", "address": "0x55aa"}}])
+
+    def test_a_session_says_which_project_and_branch_and_offers_its_folder(self):
+        project = self.root / "Projects" / "api"
+        (project / ".git").mkdir(parents=True, mode=0o700)
+        os.chmod(self.root / "Projects", 0o700)
+        os.chmod(project, 0o700)
+        (project / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+        self.session(status="busy", cwd=str(project), sessionId="00000000-0000-4000-8000-000000000001")
+        self.window()
+        row = self.rows()[0]
+        self.assertEqual((row["title"], row["detail"]), ("Fix the flaky test", "working for 2m · api (main) · ws3"))
+        self.assertEqual(row["buttons"], [{"glyph": self.agents.FOLDER_GLYPH, "label": "Open the project folder",
+                                           "action": {"kind": "open-folder", "path": str(project)}}])
+        doc, dropped = cockpit.sanitize({"rows": [row]}, "10-agents")
+        self.assertEqual((doc["rows"], dropped), ([row], 0))
+        # A session with no task in its title and no name goes by its project.
+        self.clients.clear()
+        self.session(status="idle", cwd=str(project), name="")
+        self.assertEqual(self.rows()[0]["title"], "api")
 
     def test_a_session_waiting_for_you_says_why_and_comes_first(self):
         other = self.spawn()
@@ -635,31 +698,31 @@ class Agents(Sandbox):
         self.window("0x66bb", pid=other.pid, title="✳ Asks a question", ws="5")
         rows = self.rows()
         self.assertEqual([(r["state"], r["detail"]) for r in rows],
-                         [("needs", "needs you: question · ws5 · Claude"), ("busy", "working for 2m · ws2 · Claude")])
+                         [("needs", "needs you: question · ws5"), ("busy", "working for 2m · ws2")])
         self.assertEqual(rows[0]["action"], {"kind": "focus-window", "address": "0x66bb"})
 
     def test_the_needs_text_is_preferred_and_unknown_reasons_are_shown_as_written(self):
         self.session(status="waiting", waitingFor="dialog open", needs="choose: allow or deny the edit")
-        self.assertEqual(self.rows()[0]["detail"], "needs you: choose: allow or deny the edit · no window · Claude")
+        self.assertEqual(self.rows()[0]["detail"], "needs you: choose: allow or deny the edit · no window")
         self.session(status="waiting", waitingFor="something new")
-        self.assertEqual(self.rows()[0]["detail"], "needs you: something new · no window · Claude")
+        self.assertEqual(self.rows()[0]["detail"], "needs you: something new · no window")
         self.session(status="waiting")
-        self.assertEqual(self.rows()[0]["detail"], "needs you · no window · Claude")
+        self.assertEqual(self.rows()[0]["detail"], "needs you · no window")
 
     def test_an_idle_session_says_for_how_long(self):
         self.session(status="idle", age=301)
         self.window()
         row = self.rows()[0]
-        self.assertEqual((row["glyph"], row["state"], row["detail"]), ("✳", "idle", "idle for 5m · ws3 · Claude"))
+        self.assertEqual((row["glyph"], row["state"], row["detail"]), (self.glyph["idle"], "idle", "idle for 5m · ws3"))
 
     def test_a_session_without_a_window_still_shows_without_an_action(self):
         self.session(status="busy", age=10)
         self.window(pid=1_999_999_999, title="◐ Someone else")   # a window, but not this session's
-        rows = [r for r in self.rows() if r["detail"].endswith("Claude")]
-        self.assertEqual(rows, [{"glyph": "◐", "title": "demo-session",
-                                 "detail": "working for 10s · no window · Claude", "state": "busy"}])
+        rows = [r for r in self.rows() if r["glyph"] != self.agents.ROBOT_GLYPH]
+        self.assertEqual(rows, [{"glyph": self.glyph["busy"], "title": "demo-session",
+                                 "detail": "working for 10s · no window", "state": "busy"}])
         self.session(status="busy", kind="background")
-        self.assertIn("· background ·", self.rows()[0]["detail"])
+        self.assertTrue(self.rows()[0]["detail"].endswith("· background"))
 
     def test_a_background_command_counts_as_working_and_new_statuses_are_shown_as_written(self):
         # Claude Code writes "shell" when the turn is over but a background command it
@@ -668,10 +731,11 @@ class Agents(Sandbox):
         self.window()
         row = self.rows()[0]
         self.assertEqual((row["glyph"], row["state"], row["detail"]),
-                         ("◐", "busy", "working in background for 1m · ws3 · Claude"))
+                         (self.glyph["shell"], "busy", "working in background for 1m · ws3"))
         self.session(status="compacting_context", age=65)
         row = self.rows()[0]
-        self.assertEqual((row["state"], row["detail"]), ("idle", "compacting context for 1m · ws3 · Claude"))
+        self.assertEqual((row["glyph"], row["state"], row["detail"]),
+                         (self.agents.OTHER_GLYPH, "idle", "compacting context for 1m · ws3"))
         self.assertIn("action", row)
 
     def test_stale_foreign_or_malformed_records_are_not_sessions(self):
@@ -688,7 +752,7 @@ class Agents(Sandbox):
             "missing status": lambda: self.session(status=None),
             "boolean pid": lambda: (self.sessions / "1.json").write_text(json.dumps({"pid": True, "procStart": "1", "status": "busy"})),
             "malformed": lambda: (self.sessions / f"{self.sleeper.pid}.json").write_text("{nope"),
-            "oversized": lambda: self.session(pad="x" * self.agents.SESSION_FILE_MAX),
+            "oversized": lambda: self.session(pad="x" * cockpit_agents.SESSION_FILE_MAX),
             "deep": lambda: self.session(pad=[[[[["x"]]]]]),
             "not a session file name": lambda: (self.sessions / "notes.json").write_text(json.dumps({"status": "busy"})),
         }
@@ -713,7 +777,7 @@ class Agents(Sandbox):
         self.assertEqual([(r["title"], r.get("action")) for r in rows],
                          [("The Claude one", {"kind": "focus-window", "address": "0x20"})])
         self.window("0x30", title="◐ Another Claude")   # now two candidates: no guessing
-        rows = [r for r in self.rows() if r["detail"].endswith("Claude")]
+        rows = [r for r in self.rows() if r["glyph"] != self.agents.ROBOT_GLYPH]
         self.assertEqual(len(rows), 1)
         self.assertNotIn("action", rows[0])
 
@@ -725,16 +789,16 @@ class Agents(Sandbox):
             "0x55aa": {"title": "✳ Claude task", "changedAt": time.time() - 900, "changes": 3},
             "0x77cc": {"title": "⠙ codex refactor", "changedAt": time.time(), "changes": 9}}))
         rows = self.rows()
-        self.assertEqual([(r["title"], r["state"], r["detail"]) for r in rows],
-                         [("Claude task", "needs", "needs you: question · ws3 · Claude"),
-                          ("codex refactor", "busy", "ws4 · kitty · working")])
+        self.assertEqual([(r["glyph"], r["title"], r["state"], r["detail"]) for r in rows],
+                         [(self.glyph["waiting"], "Claude task", "needs", "needs you: question · ws3"),
+                          (self.agents.ROBOT_GLYPH, "codex refactor", "busy", "ws4 · kitty · working")])
 
     def test_display_text_from_records_and_titles_is_cleaned(self):
         self.session(status="waiting", name="evil\x1b]0;pwned\x07", needs="line\nbreak\x9b")
         self.window(pid=self.sleeper.pid, title="plain title")
         row = self.rows()[0]
         self.assertEqual(row["title"], "evil�]0;pwned�")
-        self.assertEqual(row["detail"], "needs you: line�break� · ws3 · Claude")
+        self.assertEqual(row["detail"], "needs you: line�break� · ws3")
 
     def test_hostile_client_fields_do_not_break_the_provider(self):
         self.session(status="busy")
@@ -742,7 +806,7 @@ class Agents(Sandbox):
                              {"mapped": True, "address": "nothex", "pid": os.getpid()},
                              {"mapped": False, "address": "0x2", "pid": os.getpid()}])
         rows = self.rows()
-        self.assertEqual([r["detail"] for r in rows], ["working for 2m · no window · Claude"])
+        self.assertEqual([r["detail"] for r in rows], ["working for 2m · no window"])
 
 
 # ------------------------------------------------------------------ providers
@@ -809,6 +873,10 @@ class Vendoring(unittest.TestCase):
                 self.assertTrue(source.startswith("#!/usr/bin/python3\n"))
                 for banned in ("/usr/bin/env", "shell=True", "os.system", "os.popen", '"sh", "-c"', "import subprocess"):
                     self.assertNotIn(banned, source)
+        # The module the daemon and the Agents provider share: no shebang, the same bans.
+        source = (BIN / "cockpit_agents.py").read_text()
+        for banned in ("/usr/bin/env", "shell=True", "os.system", "os.popen", '"sh", "-c"', "import subprocess"):
+            self.assertNotIn(banned, source)
         qml = (ROOT / "Panel.qml").read_text()
         self.assertNotIn('"sh"', qml)
         self.assertNotIn("-c", qml.replace("-cockpit", ""))

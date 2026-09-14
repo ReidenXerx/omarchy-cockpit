@@ -1,5 +1,6 @@
 #!/usr/bin/python3
-"""Watch Hyprland window titles and record when each last changed.
+"""Watch Hyprland window titles and Claude Code sessions: when each title last changed, the
+chats that start and end, and a notification when one needs you or has finished.
 
 Why a daemon rather than polling: `hyprctl clients` serves a cached title. Sampled ten
 times over two seconds it returns the identical glyph while the compositor's own event
@@ -9,10 +10,24 @@ working right now" is the event stream, and something has to hold that socket op
 Writes $XDG_RUNTIME_DIR/omarchy-cockpit/agent-state.json:
   { "0x55...": {"title": "...", "changedAt": 1788..., "changes": 12} }
 
+Every two seconds it also reads the Claude Code session records (cockpit_agents.read_sessions)
+and keeps ~/.local/state/omarchy-cockpit/agent-history.json, the chats the Agents section
+offers to resume. It is written when a session starts or ends, at most every five minutes when
+only what the sessions are doing changed, and never when nothing did:
+  { "sessions": { "<sessionId>": {"cwd": "...", "title": "...", "name": "...",
+                                  "startedAt": 1788..., "lastSeen": 1788..., "endedAt": 0} } }
+
+A session that starts waiting for you, or one whose turn ran a minute or more and is over,
+raises a notification with a Show button that focuses its window -- unless that window is the
+one you are looking at. Whatever is already happening when the daemon starts is not news.
+
+  cockpit-agentd [--no-alerts]
+
 Bounded throughout: an event line over 8 KB is discarded, the read buffer never exceeds
 64 KB, titles are cut to 256 characters and at most 256 windows are tracked (the least
-recently changed go first). Exits with the shell that started it. Idempotent: a second
-instance exits rather than competing for the socket.
+recently changed go first); at most 50 sessions are remembered, and at most 4 notifications
+wait for a click, each for 15 minutes. Exits with the shell that started it. Idempotent: a
+second instance exits rather than competing for the socket.
 """
 import os
 import pathlib
@@ -21,6 +36,7 @@ import signal
 import socket
 import stat
 import sys
+import threading
 import time
 
 BIN = pathlib.Path(__file__).resolve().parent
@@ -28,6 +44,7 @@ sys.dont_write_bytecode = True  # no __pycache__ in the plugin (the shell watche
 sys.path.insert(0, str(BIN))
 import plugin_safety as safe  # noqa: E402
 import cockpit_common as common  # noqa: E402
+import cockpit_agents as agents  # noqa: E402
 
 STATE_DIR = common.state_dir()
 STATE = STATE_DIR / "agent-state.json"
@@ -41,6 +58,21 @@ WINDOWS_MAX = 256
 STATE_MAX = 1024 * 1024
 HEX = re.compile(r"[0-9a-fA-F]{1,16}")
 SIGNATURE = re.compile(r"[A-Za-z0-9_]{1,128}")
+
+# Sessions are read this often, and a change to what they are doing that is not a start or an
+# end waits at most this long to be written.
+POLL_EVERY = 2.0
+HISTORY_TITLES_EVERY = 300.0
+# One alert per session and kind in this long; "finished" only for a turn at least this long,
+# since a quick answer you watched arrive needs no notification. A turn is busy, shell or
+# waiting, until the session is idle again.
+ALERT_COOLDOWN = 30.0
+FINISHED_AFTER = 60.0
+TURN = ("busy", "shell", "waiting")
+NOTIFY_WAIT = 900
+NOTIFY_MAX = 4
+BODY_MAX = 160
+USAGE = "usage: cockpit-agentd [--no-alerts]"
 
 
 class LineReader:
@@ -87,13 +119,24 @@ def address(raw):
 class Tracker:
     def __init__(self, windows=None):
         self.windows = windows if windows is not None else {}
+        self.focused = None          # the focused window's address, from activewindowv2
+        self.windows_moved = False   # a window opened or closed since sessions were matched to windows
 
     def handle(self, line, now):
-        """Apply one event line; True when the state changed."""
+        """Apply one event line; True when the title state changed."""
         event, sep, payload = line.decode("utf-8", "replace").partition(">>")
         if not sep:
             return False
+        if event == "activewindowv2":
+            # Hyprland 0.56 sends the address as bare hex ("55bb524d4800"), and nothing at all
+            # when focus leaves every window.
+            self.focused = address(payload) if payload.strip() else None
+            return False
+        if event == "openwindow":
+            self.windows_moved = True
+            return False
         if event == "closewindow":
+            self.windows_moved = True
             addr = address(payload)
             return addr is not None and self.windows.pop(addr, None) is not None
         # windowtitlev2 carries the address, which windowtitle does not, and the address is
@@ -135,6 +178,223 @@ def load_state():
     newest = sorted(windows, key=lambda a: windows[a]["changedAt"], reverse=True)[:WINDOWS_MAX]
     return {a: windows[a] for a in newest}
 
+
+# ------------------------------------------------------------------ sessions and alerts
+
+def track(previous, sessions, now, focused, last_alerts, windows):
+    """(alerts, statuses) for one reading of the session records. No I/O, so every rule here is
+    a test away.
+
+    previous: {sessionId: {"status", "turnSince"}} from the last reading, or None for the first --
+    whatever is already happening when the daemon starts is not news. sessions: as
+    cockpit_agents.read_sessions gives them. focused: the focused window's address or None.
+    last_alerts: {(sessionId, kind): when}, updated in place. windows: {sessionId: address}.
+    alerts: [(kind, session)], kind "needs" (it started waiting for you) or "finished" (a turn of
+    FINISHED_AFTER or more is over)."""
+    alerts, statuses = [], {}
+    looking_at = focused.lower() if focused else None
+    for session in sessions:
+        sid = session["sessionId"]
+        if not sid:
+            continue
+        before = previous.get(sid) if previous is not None else None
+        was = before["status"] if before else None
+        status = session["status"]
+        since = session["since"] if 0 < session["since"] <= now else now
+        turn_since = (before["turnSince"] if was in TURN else since) if status in TURN else 0.0
+        statuses[sid] = {"status": status, "turnSince": turn_since}
+        if previous is None:
+            continue
+        if status == "waiting" and was != "waiting":
+            kind = "needs"
+        elif status == "idle" and was in ("busy", "shell") and since - before["turnSince"] >= FINISHED_AFTER:
+            kind = "finished"
+        else:
+            continue
+        window = windows.get(sid)
+        if looking_at and window and window.lower() == looking_at:
+            continue   # you are looking at it
+        if now - last_alerts.get((sid, kind), float("-inf")) < ALERT_COOLDOWN:
+            continue
+        last_alerts[(sid, kind)] = now
+        alerts.append((kind, session))
+    return alerts, statuses
+
+
+def session_windows(sessions):
+    """{sessionId: window} for the sessions whose window can be found; None when Hyprland could
+    not be asked."""
+    clients = common.hypr_clients()
+    if clients is None:
+        return None
+    by_pid = {}
+    for w in map(agents.window_info, clients[:agents.CLIENTS_MAX]):
+        if w is not None and w["pid"] is not None:
+            by_pid.setdefault(w["pid"], []).append(w)
+    found = {}
+    for session in sessions:
+        window = agents.window_for(session["pid"], by_pid)
+        if window is not None and session["sessionId"]:
+            found[session["sessionId"]] = window
+    return found
+
+
+def window_of(session):
+    """The session's window address now, for a notification's Show button."""
+    window = (session_windows([session]) or {}).get(session["sessionId"])
+    return window["address"] if window else None
+
+
+class Notifier:
+    """Notifications that wait for their Show button in threads of their own, so the event loop
+    never waits. At most NOTIFY_MAX wait at once; more are dropped rather than queued."""
+
+    def __init__(self, enabled=True, resolve=None):
+        self.enabled = enabled
+        self.resolve = resolve or window_of
+        self.lock = threading.Lock()
+        self.waiting = 0
+
+    def send(self, title, body, session):
+        if not self.enabled:
+            return False
+        with self.lock:
+            if self.waiting >= NOTIFY_MAX:
+                return False
+            self.waiting += 1
+        threading.Thread(target=self._deliver, args=(title, body, session), daemon=True).start()
+        return True
+
+    def _deliver(self, title, body, session):
+        try:
+            # Under /usr/bin/timeout as well as safe.run's deadline: a notification still waiting
+            # when the daemon exits must not wait for ever.
+            r = safe.run(["timeout", "--kill-after=2", str(NOTIFY_WAIT), safe.tool("notify-send"),
+                          "--app-name=Cockpit", "-A", "focus=Show", "--", title, body],
+                         timeout=NOTIFY_WAIT + 5, max_output=1024)
+            if r.returncode == 0 and r.text().strip() == "focus":
+                window = self.resolve(session)
+                if window:
+                    safe.run(common.focus_window_argv(window), timeout=3, max_output=16 * 1024)
+        except (OSError, ValueError, safe.UnsafeError):
+            pass
+        finally:
+            with self.lock:
+                self.waiting -= 1
+
+
+class SessionWatch:
+    """The Claude Code sessions, read every POLL_EVERY seconds: their history, what each is doing
+    and the alerts they raise."""
+
+    def __init__(self, tracker, notifier, history, now, read_sessions=None, map_windows=None):
+        self.tracker, self.notifier, self.history = tracker, notifier, history
+        self.read_sessions = read_sessions or agents.read_sessions
+        self.map_windows = map_windows or session_windows
+        self.statuses = None            # None until the first reading
+        self.last_alerts = {}
+        self.windows, self.window_titles, self.mapped = {}, {}, set()
+        self.last_poll = None
+        self.first = True
+        self.pending = False            # a start or an end not yet written
+        self.titles_pending = False     # only what they are doing changed
+        self.last_write = now
+
+    def due(self, now):
+        return self.last_poll is None or now - self.last_poll >= POLL_EVERY
+
+    def poll(self, now):
+        self.last_poll = now
+        sessions = self.read_sessions()
+        live = {s["sessionId"]: s for s in sessions if s["sessionId"]}
+        # Matching sessions to windows walks /proc and asks hyprctl, so it is done only when a
+        # session appears or a window opened or closed -- not on every reading.
+        if self.tracker.windows_moved or set(live) - self.mapped:
+            found = self.map_windows(list(live.values()))
+            if found is not None:
+                self.tracker.windows_moved = False
+                self.windows = {sid: w["address"] for sid, w in found.items()}
+                self.window_titles = {sid: w["title"] for sid, w in found.items()}
+                self.mapped = set(live)
+        titles = self.titles(live)
+        self.observe(live, titles, now)
+        alerts, self.statuses = track(self.statuses, sessions, now, self.tracker.focused, self.last_alerts,
+                                      self.windows)
+        for kind, session in alerts:
+            self.alert(kind, session, titles)
+        if self.pending or (self.titles_pending and now - self.last_write >= HISTORY_TITLES_EVERY):
+            self.write(now)
+
+    def titles(self, live):
+        """{sessionId: what it is doing}, from its window's title: the live one the event stream
+        gave, else the one hyprctl gave when the window was found."""
+        out = {}
+        for sid in live:
+            window = self.windows.get(sid)
+            if not window:
+                continue
+            watched = self.tracker.windows.get(window)
+            glyph, task = agents.split_glyph(watched["title"] if watched else self.window_titles.get(sid, ""))
+            if glyph in agents.CLAUDE_TITLE_GLYPHS and task:
+                out[sid] = common.clean_text(task, agents.TITLE_MAX)
+        return out
+
+    def observe(self, live, titles, now):
+        for sid, session in live.items():
+            entry = self.history.get(sid)
+            if entry is None or entry["endedAt"]:
+                # New, or a chat that ended and was resumed.
+                self.history[sid] = {"cwd": session["cwd"], "title": titles.get(sid) or (entry["title"] if entry else ""),
+                                     "name": session["name"], "startedAt": now, "lastSeen": now, "endedAt": 0.0}
+                self.pending = True
+                continue
+            entry["lastSeen"] = now
+            if session["cwd"] and session["cwd"] != entry["cwd"]:
+                entry["cwd"] = session["cwd"]
+                self.pending = True
+            for key, value in (("title", titles.get(sid)), ("name", session["name"])):
+                if value and value != entry[key]:
+                    entry[key] = value
+                    self.titles_pending = True
+        for sid, entry in self.history.items():
+            if not entry["endedAt"] and sid not in live:
+                # One that ended while no daemon was watching ended when it was last seen alive.
+                entry["endedAt"] = entry["lastSeen"] if self.first and entry["lastSeen"] else now
+                self.pending = True
+        self.first = False
+        if len(self.history) > agents.HISTORY_MAX:
+            keep = sorted(self.history, key=lambda s: self.history[s]["lastSeen"], reverse=True)[:agents.HISTORY_MAX]
+            self.history = {s: self.history[s] for s in keep}
+
+    def alert(self, kind, session, titles):
+        where = agents.project_of(session["cwd"]) or session["name"] or "Claude Code"
+        if kind == "needs":
+            title, what = "Claude needs you", agents.reason_of(session) or "waiting for you"
+        else:
+            title, what = "Claude finished", titles.get(session["sessionId"]) or session["name"] or "the turn is over"
+        self.notifier.send(title, common.clean_text(f"{where}: {what}", BODY_MAX), session)
+
+    def write(self, now):
+        try:
+            agents.save_history(self.history)
+        except (OSError, safe.UnsafeError) as e:
+            print(f"cockpit-agentd: history not saved: {common.clean_text(str(e), 200)}", file=sys.stderr)
+        self.pending = self.titles_pending = False
+        self.last_write = now
+
+
+def initial_focus():
+    """The focused window when the daemon starts; activewindowv2 events keep it current after."""
+    try:
+        r = safe.run(["hyprctl", "-j", "activewindow"], timeout=3, max_output=64 * 1024)
+        data = safe.loads(r.stdout, max_depth=8, max_items=4096, max_string=1 << 16) if r.ok else None
+    except (OSError, ValueError, safe.UnsafeError):
+        return None
+    value = data.get("address") if isinstance(data, dict) else None
+    return address(value) if isinstance(value, str) else None
+
+
+# ------------------------------------------------------------------ the socket
 
 def socket_path():
     base = os.path.join(safe.runtime_dir(), "hypr")
@@ -191,7 +451,7 @@ def flush(tracker):
     safe.write_json(STATE, tracker.windows)
 
 
-def watch(path):
+def watch(path, alerts=True):
     tracker = Tracker(load_state())
     dirty = False
     # Windows closed while no daemon was running would otherwise linger until evicted.
@@ -201,12 +461,14 @@ def watch(path):
         before = len(tracker.windows)
         tracker.windows = {a: w for a, w in tracker.windows.items() if a in live}
         dirty = len(tracker.windows) != before
+    tracker.focused = initial_focus()
+    sessions = SessionWatch(tracker, Notifier(enabled=alerts), agents.load_history(), time.time())
     reader = LineReader()
     last_flush = 0.0
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
         sock.connect(path)
         # A timeout rather than a blocking read, so the last change before a quiet spell
-        # is still written within a second.
+        # is still written within a second, and the sessions are read on time.
         sock.settimeout(1.0)
         try:
             while True:
@@ -226,16 +488,29 @@ def watch(path):
                     flush(tracker)
                     dirty = False
                     last_flush = time.time()
+                now = time.time()
+                if sessions.due(now):
+                    try:
+                        sessions.poll(now)
+                    except Exception as e:  # noqa: BLE001 - a bad reading must not end title tracking
+                        print(f"cockpit-agentd: reading sessions failed: {common.clean_text(str(e), 200)}",
+                              file=sys.stderr)
         finally:
             if dirty:
                 try:
                     flush(tracker)
                 except (OSError, safe.UnsafeError):
                     pass
+            if sessions.pending or sessions.titles_pending:
+                sessions.write(time.time())
     return 0
 
 
-def main():
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if any(arg != "--no-alerts" for arg in argv):
+        print(USAGE, file=sys.stderr)
+        return 2
     safe.die_with_parent()
     signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(0))
     if already_running():
@@ -252,7 +527,7 @@ def main():
         if not path:
             print("cockpit-agentd: no Hyprland event socket", file=sys.stderr)
             return 1
-        return watch(path)
+        return watch(path, alerts="--no-alerts" not in argv)
     except (OSError, safe.UnsafeError) as e:
         print(f"cockpit-agentd: {e}", file=sys.stderr)
         return 1

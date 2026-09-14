@@ -1,14 +1,14 @@
 #!/usr/bin/python3
-"""Agent sessions and what each one is doing: working, waiting for you, or idle.
+"""Agent sessions and what each one is doing -- working, waiting for you, idle -- and the
+chats that ended, one click from coming back.
 
-Claude Code keeps a status record for every running session in
-~/.claude/sessions/<pid>.json: "busy" for the whole of a turn, tool calls included;
-"waiting" when something needs you -- a question, a permission or other dialog, a sandbox
-request -- with the reason in `waitingFor`; "shell" when the turn is over but a
-background command it started is still running; and "idle" once it is done. That record
-is the truth for those sessions. It is tied to a window by walking up from the session's
-process to the one that owns a Hyprland window, and a record is trusted only while its
-pid still names the process that wrote it (the start time must match).
+Claude Code sessions report their own status (see bin/cockpit_agents.py). Each row says what
+the session is doing, in which project and branch, and on which workspace; a click focuses
+its window, and a button opens the project folder.
+
+A chat that ended stays for a day, from the history cockpit-agentd keeps: a click resumes it
+in your terminal, in its folder (`claude --resume <id>`), and Dismiss hides it until that
+chat ends again.
 
 Other terminal agents only advertise themselves in the window title, as a spinner glyph
 that turns while they stream output. For those the daemon records when each title last
@@ -17,7 +17,6 @@ rather than claiming the agent is idle.
 """
 import json
 import pathlib
-import re
 import stat
 import sys
 import time
@@ -26,38 +25,33 @@ sys.dont_write_bytecode = True  # no __pycache__ in the plugin (the shell watche
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "bin"))
 import plugin_safety as safe  # noqa: E402
 import cockpit_common as common  # noqa: E402
+import cockpit_agents as agents  # noqa: E402
 
 STATE = common.state_dir()
 SEEN = STATE / "agent-titles.json"
 LIVE = STATE / "agent-state.json"      # written by cockpit-agentd
 STATE_MAX = 1024 * 1024
-TITLE_MAX = 256
-CLIENTS_MAX = 512
-
-CLAUDE_SESSIONS = pathlib.Path(common.HOME) / ".claude" / "sessions"
-SESSIONS_MAX = 64
-SESSION_FILE_MAX = 16 * 1024
-SESSION_LIMITS = {"max_depth": 4, "max_items": 256, "max_string": 4096}
-SESSION_FILE = re.compile(r"([1-9][0-9]{0,9})\.json")
-PROC_START = re.compile(r"[0-9]{1,20}")
-# A status is a short lowercase word. Ones this provider does not know yet are shown as
-# written rather than dropped: a session vanishing from the hub is worse than a plain label.
-STATUS_WORD = re.compile(r"[a-z][a-z_]{0,23}")
-PARENT_DEPTH = 32
-# What Claude Code puts in front of its terminal title: two glyphs that alternate while it
-# animates and one while it is still. Used to pick its window out of several that belong
-# to one terminal process, and to take the task text from the title.
-CLAUDE_TITLE_GLYPHS = ("◐", "◑", "✳")
-# `waitingFor` as Claude Code writes it, shortened for a glance. A reason not listed here
-# is shown as written.
-WAITING_FOR = {
-    "input needed": "question",
-    "dialog open": "prompt open",
-    "sandbox request": "sandbox request",
-    "worker request": "worker request",
-    "goal proposal": "goal proposal",
-}
+TITLE_MAX = agents.TITLE_MAX
 RANK = {"needs": 0, "busy": 1, "idle": 2}
+
+# One Material Design glyph, from the Nerd Font the bar already uses, per thing a session can
+# be doing: the icon alone should say it.
+STATUS_GLYPHS = {
+    "waiting": chr(0xF009E),   # md-bell_ring: needs you
+    "busy": chr(0xF0996),      # md-progress_clock: working
+    "shell": chr(0xF07B7),     # md-console_line: a background command it started still runs
+    "idle": chr(0xF05E1),      # md-check_circle_outline: done, waiting for your next message
+}
+OTHER_GLYPH = chr(0xF0493)     # md-cog: a status this version does not know yet (compacting, ...)
+ENDED_GLYPH = chr(0xF02DA)     # md-history
+RESUME_GLYPH = chr(0xF099B)    # md-restore
+FOLDER_GLYPH = chr(0xF0770)    # md-folder_open
+ROBOT_GLYPH = chr(0xF06A9)     # md-robot: an agent known only from its window title
+
+# Chats that ended are offered back for a day, and at most this many: the section is for what
+# is happening, and older chats are one `claude --resume` away.
+ENDED_WITHIN = 24 * 3600
+ENDED_MAX = 8
 
 # How long after the last title change a title-only session still counts as working. The
 # spinner turns a few times a second while busy, so anything under a couple of seconds
@@ -69,19 +63,6 @@ TERMINALS = {"foot", "dev.warp.Warp", "Alacritty", "kitty", "com.mitchellh.ghost
              "org.wezfurlong.wezterm", "xterm-256color", "konsole"}
 
 
-# A leading non-alphanumeric glyph followed by text is the shape every one of these
-# tools uses. Matching the SHAPE rather than a list of glyphs is what makes this survive
-# a tool changing its spinner.
-def split_glyph(title):
-    t = (title or "").strip()
-    if not t:
-        return "", ""
-    first = t[0]
-    if first.isalnum() or first in "/~.(<[\"'":
-        return "", t
-    return first, t[1:].strip()
-
-
 def load(path):
     try:
         data = safe.read_json(path, STATE_MAX, default={}, max_depth=4, max_items=8192,
@@ -91,156 +72,55 @@ def load(path):
     return data if isinstance(data, dict) else {}
 
 
-def elapsed(age):
-    return f"{age // 3600}h {age % 3600 // 60}m" if age >= 3600 else (f"{age // 60}m" if age >= 60 else f"{age}s")
-
-
-def text_field(raw, key, limit):
-    value = raw.get(key)
-    return common.clean_text(value, limit) if isinstance(value, str) else ""
-
-
-# ------------------------------------------------------------------ processes and windows
-
-def proc_fields(pid):
-    """/proc/<pid>/stat fields after the command name (state first), or None."""
-    content = common.proc_read(pid, "stat", 4096)
-    if not content or ")" not in content:
+def folder_button(cwd):
+    """The project folder, while it is still a folder."""
+    if not cwd or common.lstat_kind(cwd) != stat.S_IFDIR:
         return None
-    return content[content.rfind(")") + 2:].split()
+    action = common.action_or_none({"kind": "open-folder", "path": cwd})
+    return {"glyph": FOLDER_GLYPH, "label": "Open the project folder", "action": action} if action else None
 
 
-def same_process(pid, proc_start):
-    # starttime is field 22 of /proc/<pid>/stat, index 19 once pid and comm are cut off.
-    # A pid is reused after its process exits; the start time is what proves the record
-    # still describes the process running now.
-    fields = proc_fields(pid)
-    return fields is not None and len(fields) > 19 and fields[19] == proc_start
-
-
-def window_info(client):
-    if not isinstance(client, dict) or not client.get("mapped"):
-        return None
-    address = client.get("address")
-    if not isinstance(address, str) or not common.ADDRESS.fullmatch(address):
-        return None
-    pid = client.get("pid")
-    workspace = client.get("workspace")
-    cls = client.get("class")
-    return {
-        "address": address,
-        "pid": pid if isinstance(pid, int) and not isinstance(pid, bool) and pid > 1 else None,
-        "class": cls if isinstance(cls, str) else "",
-        "title": (client.get("title") if isinstance(client.get("title"), str) else "")[:TITLE_MAX],
-        "ws": common.clean_text(workspace.get("name", "?"), 32) if isinstance(workspace, dict) else "?",
-    }
-
-
-def window_for(pid, by_pid):
-    """The window a process runs in: the nearest ancestor that owns one."""
-    for _ in range(PARENT_DEPTH):
-        candidates = by_pid.get(pid)
-        if candidates:
-            if len(candidates) == 1:
-                return candidates[0]
-            # One terminal process with several windows (a foot server, ghostty, kitty in
-            # single-instance mode). Only a window titled the way Claude Code titles its
-            # terminal can be told apart, and only if exactly one is.
-            titled = [w for w in candidates if split_glyph(w["title"])[0] in CLAUDE_TITLE_GLYPHS]
-            return titled[0] if len(titled) == 1 else None
-        fields = proc_fields(pid)
-        if fields is None or len(fields) < 2 or not fields[1].isdigit():
-            return None
-        pid = int(fields[1])
-        if pid <= 1:
-            return None
-    return None
+def place(cwd):
+    """ "project (branch)", "project" or "" -- where a session works, at a glance."""
+    project = agents.project_of(cwd)
+    branch = agents.branch_of(cwd) if project else ""
+    return f"{project} ({branch})" if branch else project
 
 
 # ------------------------------------------------------------------ Claude Code sessions
 
-def parse_session(raw, pid):
-    """The fields this provider uses from one session record, checked; None if unusable."""
-    if not isinstance(raw, dict):
-        return None
-    if isinstance(raw.get("pid"), bool) or raw.get("pid") != pid:
-        return None
-    proc_start = raw.get("procStart")
-    if isinstance(proc_start, int) and not isinstance(proc_start, bool):
-        proc_start = str(proc_start)
-    if not isinstance(proc_start, str) or not PROC_START.fullmatch(proc_start):
-        return None
-    status = raw.get("status")
-    if not isinstance(status, str) or not STATUS_WORD.fullmatch(status):
-        return None   # an older Claude Code without status: its title still shows it
-    kind = raw.get("kind")
-    return {
-        "pid": pid,
-        "procStart": proc_start,
-        "status": status,
-        "waitingFor": text_field(raw, "waitingFor", 64),
-        "needs": text_field(raw, "needs", 160),
-        "since": common.number(raw.get("statusUpdatedAt")) / 1000,
-        "name": text_field(raw, "name", 64),
-        "kind": kind if isinstance(kind, str) else "",
-    }
-
-
-def read_sessions():
-    """Live Claude Code sessions. A missing directory, a foreign or symlinked file, a record
-    over its caps or one whose process is gone is simply not a session."""
-    try:
-        entries = safe.list_dir(CLAUDE_SESSIONS, max_entries=4 * SESSIONS_MAX)
-    except (OSError, safe.UnsafeError):
-        return []
-    sessions = []
-    for name, st in entries:
-        match = SESSION_FILE.fullmatch(name)
-        if not match or not stat.S_ISREG(st.st_mode):
-            continue
-        try:
-            raw = safe.read_json(CLAUDE_SESSIONS / name, SESSION_FILE_MAX, default=None, **SESSION_LIMITS)
-        except (OSError, safe.UnsafeError):
-            continue
-        session = parse_session(raw, int(match.group(1)))
-        if session is not None and same_process(session["pid"], session["procStart"]):
-            sessions.append(session)
-            if len(sessions) >= SESSIONS_MAX:
-                break
-    return sessions
-
-
 def session_row(session, window, now):
     since = session["since"]
-    age = elapsed(int(now - since)) if 0 < since <= now else ""
+    age = agents.elapsed(int(now - since)) if 0 < since <= now else ""
     for_age = f" for {age}" if age else ""
     status = session["status"]
     if status == "waiting":
-        reason = session["needs"] or WAITING_FOR.get(session["waitingFor"], session["waitingFor"])
-        glyph, state, label = "●", "needs", "needs you" + (f": {reason}" if reason else "")
+        reason = agents.reason_of(session)
+        state, label = "needs", "needs you" + (f": {reason}" if reason else "")
     elif status == "busy":
-        glyph, state, label = "◐", "busy", "working" + for_age
+        state, label = "busy", "working" + for_age
     elif status == "shell":
         # The turn is over, but a background command the session started is still running.
         # Claude Code counts that as working, and something is in motion, so it is busy.
-        glyph, state, label = "◐", "busy", "working in background" + for_age
+        state, label = "busy", "working in background" + for_age
     elif status == "idle":
-        glyph, state, label = "✳", "idle", "idle" + for_age
+        state, label = "idle", "idle" + for_age
     else:
-        glyph, state, label = "✳", "idle", status.replace("_", " ") + for_age
+        state, label = "idle", status.replace("_", " ") + for_age
 
-    title = ""
+    task = ""
     if window is not None:
-        title_glyph, task = split_glyph(window["title"])
-        if title_glyph in CLAUDE_TITLE_GLYPHS:
-            title = task
+        title_glyph, text = agents.split_glyph(window["title"])
+        if title_glyph in agents.CLAUDE_TITLE_GLYPHS:
+            task = text
         where = f"ws{window['ws']}"
     else:
         where = "background" if session["kind"] not in ("", "interactive") else "no window"
     row = {
-        "glyph": glyph,
-        "title": common.clean_text(title or session["name"] or "Claude Code", TITLE_MAX),
-        "detail": f"{label} · {where} · Claude",
+        "glyph": STATUS_GLYPHS.get(status, OTHER_GLYPH),
+        "title": common.clean_text(task or session["name"] or agents.project_of(session["cwd"]) or "Claude Code",
+                                   TITLE_MAX),
+        "detail": " · ".join(part for part in (label, place(session["cwd"]), where) if part),
         "state": state,
     }
     if window is not None:
@@ -248,7 +128,44 @@ def session_row(session, window, now):
         action = common.action_or_none({"kind": "focus-window", "address": window["address"]})
         if action:
             row["action"] = action
+    folder = folder_button(session["cwd"])
+    if folder:
+        row["buttons"] = [folder]
     return row
+
+
+def ended_rows(history, live_ids, now):
+    """The chats that ended in the last day, newest first. A click resumes one; Dismiss hides it
+    until it ends again, since the marker is when it ended."""
+    ended = sorted(((sid, entry) for sid, entry in history.items()
+                    if sid not in live_ids and entry["endedAt"] and 0 <= now - entry["endedAt"] <= ENDED_WITHIN),
+                   key=lambda item: item[1]["endedAt"], reverse=True)
+    rows = []
+    for sid, entry in ended:
+        if len(rows) >= ENDED_MAX:
+            break
+        cwd = entry["cwd"]
+        if not cwd or common.lstat_kind(cwd) != stat.S_IFDIR:
+            continue   # nowhere left to resume it from
+        resume = common.action_or_none({"kind": "resume-agent", "session": sid, "cwd": cwd})
+        if resume is None:
+            continue
+        ago = f"ended {agents.elapsed(int(now - entry['endedAt']))} ago"
+        row = {
+            "glyph": ENDED_GLYPH,
+            "title": common.clean_text(entry["title"] or entry["name"] or agents.project_of(cwd) or "Claude Code",
+                                       TITLE_MAX),
+            "detail": " · ".join(part for part in (ago, place(cwd)) if part),
+            "state": "idle",
+            "action": resume,
+            "buttons": [{"glyph": RESUME_GLYPH, "label": "Resume this chat in a terminal", "action": resume}],
+            "dismiss": {"key": sid, "marker": str(int(entry["endedAt"]))},
+        }
+        folder = folder_button(cwd)
+        if folder:
+            row["buttons"].append(folder)
+        rows.append(row)
+    return rows
 
 
 # ------------------------------------------------------------------ title-only agents
@@ -261,7 +178,7 @@ def title_rows(windows, claimed, now):
         addr = w["address"]
         if addr in claimed or w["class"] not in TERMINALS:
             continue
-        glyph, task = split_glyph(w["title"])
+        glyph, task = agents.split_glyph(w["title"])
         if not glyph and addr not in live:
             continue  # a plain-titled terminal the daemon has never seen is just a shell
 
@@ -276,7 +193,7 @@ def title_rows(windows, claimed, now):
         busy = last_change > 0 and (now - last_change) < BUSY_WINDOW
         # Prefer the daemon's title: it is the live one.
         if isinstance(watched.get("title"), str) and watched["title"]:
-            glyph, task = split_glyph(watched["title"][:TITLE_MAX])
+            glyph, task = agents.split_glyph(watched["title"][:TITLE_MAX])
 
         since = common.number(prev.get("since"), now) if prev.get("task") == task else now
         fresh[addr] = {"glyph": glyph, "task": task, "since": since}
@@ -286,12 +203,12 @@ def title_rows(windows, claimed, now):
         reference = last_change if last_change > 0 else since
         age = max(0, int(now - reference))
         row = {
-            "glyph": glyph,
+            "glyph": ROBOT_GLYPH,
             "title": common.clean_text(task, TITLE_MAX) or "(no task)",
             # "last active" rather than "idle": a title spinner only turns while the agent
             # streams output, so silence is not proof that nothing is happening.
             "detail": f"ws{w['ws']} · {common.clean_text(w['class'], 64)} · "
-                      + ("working" if busy else f"last active {elapsed(age)}"),
+                      + ("working" if busy else f"last active {agents.elapsed(age)}"),
             "state": "busy" if busy else "idle",
         }
         action = common.action_or_none({"kind": "focus-window", "address": addr})
@@ -309,25 +226,29 @@ def title_rows(windows, claimed, now):
 def main():
     now = time.time()
     clients = common.hypr_clients() or []
-    windows = [w for w in map(window_info, clients[:CLIENTS_MAX]) if w is not None]
+    windows = [w for w in map(agents.window_info, clients[:agents.CLIENTS_MAX]) if w is not None]
     by_pid = {}
     for w in windows:
         if w["pid"] is not None:
             by_pid.setdefault(w["pid"], []).append(w)
 
-    rows, claimed = [], set()
-    for session in read_sessions():
-        window = window_for(session["pid"], by_pid)
+    rows, claimed, live_ids = [], set(), set()
+    for session in agents.read_sessions():
+        window = agents.window_for(session["pid"], by_pid)
         if window is not None:
             claimed.add(window["address"])
+        if session["sessionId"]:
+            live_ids.add(session["sessionId"])
         rows.append(session_row(session, window, now))
     rows += title_rows(windows, claimed, now)
 
-    # What needs you first, then what is working: those are what you opened the hub for.
+    # What needs you first, then what is working: those are what you opened the hub for. The
+    # chats that ended come after everything that is still running.
     rows.sort(key=lambda r: (RANK.get(r["state"], 2), r["title"]))
+    rows += ended_rows(agents.load_history(), live_ids, now)
 
     print(json.dumps({
-        "section": "Agents", "glyph": "󰚩", "priority": 10, "intervalSec": 2, "timeoutSec": 6,
+        "section": "Agents", "glyph": ROBOT_GLYPH, "priority": 10, "intervalSec": 2, "timeoutSec": 6,
         "rows": rows
     }, ensure_ascii=False))
 

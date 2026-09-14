@@ -9,7 +9,12 @@ path or ~/path inside your home directory) when it exists, otherwise the usual s
 A repository is untrusted data: git runs with hooks and the filesystem monitor off, every
 filter driver the repository defines blanked, no system config and no optional locks (see
 cockpit_common.git_hardening). The walk never follows a symlink.
+
+A repo you know about can be dismissed. It stays hidden until something in it changes -- a
+commit, a push or pull, another changed file, another edit -- because the row carries a
+marker summing up exactly that (see marker()).
 """
+import hashlib
 import json
 import math
 import os
@@ -43,9 +48,11 @@ DEADLINE = 17.0
 # Override with a number of days in ~/.config/omarchy/cockpit/dirty-within-days.
 DIRTY_WITHIN_DAYS_FILE = pathlib.Path(HOME) / ".config/omarchy/cockpit/dirty-within-days"
 DEFAULT_DIRTY_WITHIN_DAYS = 7
-# Stat at most this many changed files to date the work. A repo with 84 changes does not
-# need 84 stats to answer "was this touched recently".
-MTIME_SAMPLE = 25
+# Stat at most this many changed files to date the work. Enough that an edit to any of them
+# brings a dismissed repo back, few enough that a checkout with thousands of changes stays
+# cheap: an lstat each, every two minutes.
+MTIME_SAMPLE = 400
+FOLDER_GLYPH = "\U000f0770"   # md-folder_open
 
 
 def expand(line):
@@ -160,6 +167,16 @@ def newest_change(repo, entries):
     return newest
 
 
+def marker(branch, ahead, behind, entries, partial, newest):
+    """What a dismissed row is compared with: the branch, ahead/behind, the changed files and
+    the newest edit among them. A commit, a push or pull, another file or another edit all
+    change it, and the row comes back."""
+    digest = hashlib.sha256()
+    for part in (branch, str(ahead), str(behind), "partial" if partial else "", repr(newest), *sorted(entries)):
+        digest.update(part.encode("utf-8", "replace") + b"\0")
+    return digest.hexdigest()[:32]
+
+
 def ago(seconds):
     days = seconds / 86400
     if days < 1:
@@ -243,6 +260,10 @@ def main():
         action = common.action_or_none({"kind": "terminal", "argv": ["git", "-C", repo, "status"]})
         if action:
             row["action"] = action
+        folder = common.action_or_none({"kind": "open-folder", "path": repo})
+        if folder:
+            row["buttons"] = [{"glyph": FOLDER_GLYPH, "label": "Open the folder", "action": folder}]
+        row["dismiss"] = {"key": repo, "marker": marker(branch, ahead, behind, entries, partial, changed_at)}
         rows.append(row)
     # Unpushed first, then whatever you touched most recently.
     rows.sort(key=lambda r: (r["_ahead"] == 0, r["_age"]))

@@ -31,15 +31,25 @@ It prints ONE JSON object on stdout:
         "glyph":  "󰚩",          # optional, per row
         "title":  "crypto-bot",
         "detail": "3 commits ahead",
-        "state":  "busy",       # ok | busy | warn | idle  -> colour only
+        "state":  "busy",       # ok | busy | warn | needs | idle  -> colour; busy and needs light the bar dot
         "progress": 42,         # optional 0-100, draws a bar
-        "action": {"kind": "focus-window", "address": "0x55d0c0ffee"}   # optional
+        "action": {"kind": "focus-window", "address": "0x55d0c0ffee"},   # optional: a click
+        "buttons": [            # optional, at most 3, shown on the row
+          {"glyph": "...", "label": "Open the folder", "action": {"kind": "open-folder", "path": "/home/me/api"},
+           "confirm": "Stop node (pid 4121)?"}                            # confirm: optional, asks first
+        ],
+        "dismiss": {"key": "/home/me/api", "marker": "3f2a9c"}           # optional: can be hidden
       }
     ]
   }
 
 Actions are structured, never shell commands -- see cockpit_common.validate_action for
-the three kinds and the programs they may run.
+the kinds and the programs they may run.
+
+A row with "dismiss" gets a Dismiss button. A dismissed row stays hidden for as long as its
+marker is the one you dismissed -- the provider sums up what the row showed, so a repo with a
+new commit comes back -- and the section heading counts what is hidden, with a click to
+bring it all back. Dismissals are kept in ~/.local/state/omarchy-cockpit/dismissed.json.
 
 Limits: 256 KB of output, 200 rows, 1 KB per string, 30 s. Anything else on stdout, a
 non-zero exit, a timeout or an overrun means the provider is skipped (its last good
@@ -49,9 +59,11 @@ say why.
 import collections
 import concurrent.futures
 import json
+import os
 import pathlib
 import re
 import shlex
+import signal
 import stat
 import sys
 import time
@@ -66,8 +78,8 @@ PLUGIN_DIR = BIN.parent
 BUILTIN_DIR = PLUGIN_DIR / "providers"
 # Shipped providers, and the budget each gets before it has declared its own.
 BUILTIN_PROVIDERS = {"05-reboot": 6, "10-agents": 6, "20-transfers": 6, "30-jobs": 6,
-                     "40-git": 20, "50-updates": 30, "60-dgpu": 6, "70-tailscale": 10,
-                     "80-disk": 10}
+                     "40-git": 20, "45-ports": 8, "50-updates": 30, "60-dgpu": 6,
+                     "70-tailscale": 10, "72-network": 8, "75-devices": 8, "80-disk": 10}
 USER_DIR = pathlib.Path(common.HOME) / ".config/omarchy/cockpit/providers"
 CACHE = common.state_dir() / "providers"
 PYTHON = "/usr/bin/python3"
@@ -82,8 +94,27 @@ USER_PROVIDERS_MAX = 16
 USER_DIR_ENTRIES_MAX = 256
 CACHE_MAX = 1024 * 1024
 HUB_OUTPUT_MAX = 2 * 1024 * 1024
-STATES = ("ok", "busy", "warn", "idle")
-NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+STATES = ("ok", "busy", "warn", "needs", "idle")
+NAME = common.PROVIDER_NAME
+BUTTONS_MAX = 3
+LABEL_MAX = 48
+CONFIRM_MAX = 160
+
+DISMISSED = common.persistent_dir() / "dismissed.json"
+DISMISSED_FILE_MAX = 512 * 1024
+DISMISSED_PROVIDERS = 64
+DISMISSED_PER_PROVIDER = 256
+# A dismissal nobody has needed for half a year belongs to a row that is long gone.
+DISMISSED_KEEP_SEC = 180 * 86400
+DISMISS_GLYPH = "\U000f0209"   # md-eye_off
+# Stopping a process changes what these show; their caches are dropped so the next refresh runs them.
+STOP_REFRESHES = ("20-transfers", "30-jobs", "45-ports")
+# Clicks that fail where nothing on screen would say so get a notification.
+TELL_WHEN_FAILED = ("open-url", "open-folder", "stop-process", "resume-agent")
+
+CLAUDE_PROGRAMS = (pathlib.Path(common.HOME) / ".local/bin/claude", pathlib.Path(common.HOME) / ".claude/local/claude")
+CLAUDE_PROJECTS = pathlib.Path(common.HOME) / ".claude" / "projects"
+PROJECT_DIRS_MAX = 4096
 
 Provider = collections.namedtuple("Provider", "name argv origin path problem")
 
@@ -142,6 +173,29 @@ def _clamp(value, default, low, high):
     return max(low, min(high, value))
 
 
+def _provider_action(raw):
+    """A validated action a provider may attach, or ActionError. Dismissing is the runner's."""
+    action = common.validate_action(raw)
+    if action["kind"] in common.RUNNER_KINDS:
+        raise common.ActionError("only the runner dismisses rows")
+    return action
+
+
+def _button(raw):
+    if not isinstance(raw, dict):
+        return None
+    try:
+        action = _provider_action(raw.get("action"))
+    except common.ActionError:
+        return None
+    button = {"glyph": common.clean_text(raw.get("glyph"), 16), "label": common.clean_text(raw.get("label"), LABEL_MAX),
+              "action": action}
+    confirm = common.clean_text(raw.get("confirm"), CONFIRM_MAX)
+    if confirm:
+        button["confirm"] = confirm
+    return button
+
+
 def sanitize(parsed, name):
     """(doc, dropped actions). Only the documented fields survive, each typed and bounded,
     every action validated -- the cache and the panel only ever see this form."""
@@ -162,9 +216,19 @@ def sanitize(parsed, name):
         action = raw.get("action")
         if action is not None and action != "":
             try:
-                row["action"] = common.validate_action(action)
+                row["action"] = _provider_action(action)
             except common.ActionError:
                 dropped += 1
+        buttons = raw.get("buttons")
+        if isinstance(buttons, list):
+            kept = [_button(b) for b in buttons[:BUTTONS_MAX]]
+            dropped += sum(1 for b in kept if b is None)
+            if any(kept):
+                row["buttons"] = [b for b in kept if b is not None]
+        dismiss = raw.get("dismiss")
+        if isinstance(dismiss, dict) and common.dismiss_key(dismiss.get("key")) is not None \
+                and common.dismiss_marker(dismiss.get("marker", "")) is not None:
+            row["dismiss"] = {"key": dismiss["key"], "marker": dismiss.get("marker", "")}
         rows.append(row)
     doc = {"section": common.clean_text(parsed.get("section"), 64) or name,
            "glyph": common.clean_text(parsed.get("glyph"), 16),
@@ -254,6 +318,87 @@ def run_one(provider, force=False):
     return fresh, warning or "ok"
 
 
+# ------------------------------------------------------------------ dismissed rows
+
+def load_dismissed():
+    """{provider: {key: {"marker", "at"}}}, validated and capped; {} when missing or unusable."""
+    try:
+        raw = safe.read_json(DISMISSED, DISMISSED_FILE_MAX, default={}, max_depth=4, max_items=40000, max_string=1024)
+    except (OSError, safe.UnsafeError):
+        return {}
+    store = {}
+    for provider, entries in (raw.items() if isinstance(raw, dict) else ()):
+        if len(store) >= DISMISSED_PROVIDERS:
+            break
+        if not NAME.fullmatch(provider) or not isinstance(entries, dict):
+            continue
+        kept = {}
+        for key, entry in entries.items():
+            if len(kept) >= DISMISSED_PER_PROVIDER:
+                break
+            if common.dismiss_key(key) is None or not isinstance(entry, dict) \
+                    or common.dismiss_marker(entry.get("marker")) is None:
+                continue
+            kept[key] = {"marker": entry["marker"], "at": _clamp(entry.get("at"), 0.0, 0.0, 1e11)}
+        if kept:
+            store[provider] = kept
+    return store
+
+
+def save_dismissed(store, now=None):
+    now = time.time() if now is None else now
+    kept = {}
+    for provider, entries in store.items():
+        fresh = sorted(((k, e) for k, e in entries.items() if now - e["at"] < DISMISSED_KEEP_SEC),
+                       key=lambda item: item[1]["at"], reverse=True)[:DISMISSED_PER_PROVIDER]
+        if fresh:
+            kept[provider] = dict(fresh)
+    safe.ensure_dir(DISMISSED.parent)
+    safe.write_json(DISMISSED, kept)
+
+
+def apply_dismissals(name, doc, store):
+    """(doc as the panel gets it, whether the store changed). A dismissed row is left out while its marker is the
+    one you dismissed; the first time it differs -- a new commit, another changed file -- the row is back and the
+    dismissal forgotten. Every row that can be dismissed gets the button for it."""
+    entries = store.get(name, {})
+    rows, hidden, changed = [], 0, False
+    for row in doc["rows"]:
+        dismiss = row.get("dismiss")
+        if dismiss is None:
+            rows.append(row)
+            continue
+        entry = entries.get(dismiss["key"])
+        if entry is not None and entry["marker"] == dismiss["marker"]:
+            hidden += 1
+            continue
+        if entry is not None:
+            del entries[dismiss["key"]]
+            changed = True
+        shown = {k: v for k, v in row.items() if k != "dismiss"}
+        shown["buttons"] = list(row.get("buttons", [])) + [{
+            "glyph": DISMISS_GLYPH, "label": "Dismiss until it changes",
+            "action": {"kind": "dismiss", "provider": name, "key": dismiss["key"], "marker": dismiss["marker"]}}]
+        rows.append(shown)
+    if changed and not entries:
+        store.pop(name, None)
+    return dict(doc, rows=rows, provider=name, dismissed=hidden), changed
+
+
+def dismiss(provider, key, marker):
+    store = load_dismissed()
+    store.setdefault(provider, {})[key] = {"marker": marker, "at": time.time()}
+    save_dismissed(store)
+
+
+def undismiss(provider):
+    store = load_dismissed()
+    if store.pop(provider, None) is not None:
+        save_dismissed(store)
+
+
+# ------------------------------------------------------------------ collecting
+
 def collect(force=False, only=None):
     """([(name, doc)], notes). Providers run concurrently: each is bounded by its own
     30 s ceiling, so the whole run is too, whatever the number of providers."""
@@ -268,11 +413,21 @@ def collect(force=False, only=None):
                 except Exception as e:   # a bug in one provider's handling is still just one note
                     results[name] = (None, f"runner error: {common.clean_text(str(e), 120)}")
     sections, notes = [], {}
+    store, store_changed = load_dismissed(), False
     for p in chosen:
         doc, note = results[p.name]
         notes[p.name] = note
-        if doc and doc["rows"]:
+        if not doc:
+            continue
+        doc, changed = apply_dismissals(p.name, doc, store)
+        store_changed = store_changed or changed
+        if doc["rows"] or doc["dismissed"]:
             sections.append((p.name, doc))
+    if store_changed:
+        try:
+            save_dismissed(store)
+        except (OSError, safe.UnsafeError) as e:
+            notes["dismissed"] = f"dismissals not saved: {common.clean_text(str(e), 160)}"
     sections.sort(key=lambda item: (item[1]["priority"], item[1]["section"]))
     return sections, notes
 
@@ -316,16 +471,105 @@ def resolve(action):
     return [safe.tool(tool), *args], {}
 
 
+def ancestors(pid, depth=64):
+    out = set()
+    for _ in range(depth):
+        fields = common.proc_stat_fields(pid)
+        if fields is None or len(fields) < 2 or not fields[1].isdigit() or int(fields[1]) <= 1:
+            break
+        pid = int(fields[1])
+        out.add(pid)
+    return out
+
+
+def stop_process(pid, start):
+    """SIGTERM to a process of yours that is still the one the row showed. The pid is pinned with a pidfd before
+    it is checked, so it cannot pass to another process between the check and the signal."""
+    try:
+        fd = os.pidfd_open(pid)
+    except ProcessLookupError:
+        raise common.ActionError("that process has already exited") from None
+    try:
+        if common.proc_start(pid) != start:
+            raise common.ActionError("that process has already exited")
+        if os.stat(f"/proc/{pid}").st_uid != os.getuid():
+            raise common.ActionError("that process is not yours")
+        if pid == os.getpid() or pid in ancestors(os.getpid()):
+            raise common.ActionError("that process is running Cockpit")
+        signal.pidfd_send_signal(fd, signal.SIGTERM)
+    finally:
+        os.close(fd)
+    for name in STOP_REFRESHES:
+        try:
+            safe.remove_file(CACHE / f"{name}.json")
+        except (OSError, safe.UnsafeError):
+            pass
+
+
+def claude_program():
+    """Claude Code's launcher: yours when it is a file you own that nobody else can write, else a system one."""
+    for path in CLAUDE_PROGRAMS:
+        try:
+            safe.trusted_user_file(path)
+        except (OSError, safe.UnsafeError):
+            continue
+        return str(path)
+    if safe.has_tool("claude"):
+        return safe.tool("claude")
+    raise common.ActionError("Claude Code was not found in ~/.local/bin or /usr/bin")
+
+
+def transcript_exists(session, cwd):
+    """Whether Claude Code still has that conversation. It files a transcript under a folder named from the
+    project's path, every character but letters, digits and "-" turned into "-"; the other folders are looked
+    through as well, in case that ever changes."""
+    name = session + ".jsonl"
+    if common.lstat_kind(CLAUDE_PROJECTS / re.sub(r"[^A-Za-z0-9-]", "-", cwd) / name) == stat.S_IFREG:
+        return True
+    try:
+        entries = safe.list_dir(CLAUDE_PROJECTS, max_entries=PROJECT_DIRS_MAX)
+    except (OSError, safe.UnsafeError):
+        return False
+    return any(stat.S_ISDIR(st.st_mode) and common.lstat_kind(CLAUDE_PROJECTS / entry / name) == stat.S_IFREG
+               for entry, st in entries)
+
+
+def resume_agent(session, cwd):
+    if common.lstat_kind(cwd) != stat.S_IFDIR:
+        raise common.ActionError("that session's folder is gone")
+    if not transcript_exists(session, cwd):
+        raise common.ActionError("that conversation is no longer on disk")
+    # A resumed chat is a working session, not a glance: your own terminal, in the project's folder, started
+    # detached through uwsm by the panel like every app Omarchy launches.
+    return {"exec": [safe.tool("uwsm-app"), "--", safe.tool("xdg-terminal-exec"), f"--dir={cwd}", "--",
+                     claude_program(), "--resume", session]}
+
+
 def perform(action):
     """Carry out a validated action. Returns what the panel must start itself, or None."""
-    if action["kind"] == "focus-window":
-        # Hyprland 0.56 dispatchers are Lua; the address was matched against
-        # 0x[0-9a-fA-F]{1,16}, so nothing else can reach the expression.
-        expr = 'hl.dsp.focus({ window = "address:%s" })' % action["address"]
-        r = safe.run(["hyprctl", "dispatch", expr], timeout=3, max_output=16 * 1024)
+    kind = action["kind"]
+    if kind == "focus-window":
+        r = safe.run(common.focus_window_argv(action["address"]), timeout=3, max_output=16 * 1024)
         if not r.ok:
             raise common.ActionError(f"hyprctl dispatch failed: {common.clean_text(r.text().strip(), 160)}")
         return None
+    if kind == "dismiss":
+        dismiss(action["provider"], action["key"], action["marker"])
+        return None
+    if kind == "undismiss":
+        undismiss(action["provider"])
+        return None
+    if kind == "stop-process":
+        stop_process(action["pid"], action["start"])
+        return None
+    if kind in ("open-url", "open-folder"):
+        target = action["url"] if kind == "open-url" else action["path"]
+        if kind == "open-folder" and common.lstat_kind(target) != stat.S_IFDIR:
+            raise common.ActionError("that folder is gone")
+        # A browser or a file manager has to outlive this helper, so the panel starts it detached.
+        return {"exec": [safe.tool("uwsm-app"), "--", safe.tool("xdg-open"), target]}
+    if kind == "resume-agent":
+        return resume_agent(action["session"], action["cwd"])
     argv, env = resolve(action)
     if action["kind"] == "run":
         safe.spawn(argv, timeout=common.RUN_TIMEOUT.get(action["argv"][0], common.RUN_TIMEOUT_DEFAULT),
@@ -341,15 +585,27 @@ def perform(action):
     return {"exec": [safe.tool(TERMINAL), " ".join(words)]}
 
 
+def tell(message):
+    """Say why a click did nothing: the panel shows none of this helper's errors."""
+    try:
+        safe.spawn(["notify-send", "--app-name=Cockpit", "--", "Cockpit", message], timeout=10)
+    except (OSError, safe.UnsafeError):
+        pass
+
+
 def action_main(stream=None):
     stream = stream or sys.stdin.buffer
+    action = None
     try:
         raw = read_line(stream, common.ACTION_MAX)
         action = common.validate_action(
             safe.loads(raw, max_depth=4, max_items=64, max_string=common.ARG_MAX))
         result = perform(action)
     except (ValueError, OSError, safe.UnsafeError) as e:
-        print(f"cockpit action: {common.clean_text(str(e), 300)}", file=sys.stderr)
+        message = common.clean_text(str(e), 300)
+        print(f"cockpit action: {message}", file=sys.stderr)
+        if action is not None and action["kind"] in TELL_WHEN_FAILED:
+            tell(message)
         return 2
     if result is not None:
         print(json.dumps(result, ensure_ascii=False))

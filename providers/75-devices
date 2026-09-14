@@ -1,0 +1,214 @@
+#!/usr/bin/python3
+"""What is plugged in or paired right now: external displays, Bluetooth devices that are
+connected (with their battery), and USB devices in external ports.
+
+Displays come from Hyprland; the laptop's own panel is always there and is left out.
+Bluetooth comes from BlueZ on the system bus, asked without starting it when it is not
+running: only devices connected now, not everything ever paired, and a battery under 20% is
+a warning. USB comes from sysfs, and "external" is what the firmware says about the port a
+device is in (its `removable` attribute): a device in a port described as removable is
+listed; one described as fixed -- a webcam, a fingerprint reader, the Bluetooth adapter on
+the board -- is not; and one the firmware cannot describe ("unknown") is listed only when it
+hangs off a hub that is itself external, such as a dock or a hub you plugged in. Hubs are
+not rows of their own.
+"""
+import json
+import os
+import pathlib
+import re
+import sys
+
+sys.dont_write_bytecode = True  # no __pycache__ in the plugin (the shell watches it)
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "bin"))
+import plugin_safety as safe  # noqa: E402
+import cockpit_common as common  # noqa: E402
+
+GLYPH = "\U000f0fb0"              # md-devices
+GLYPH_MONITOR = "\U000f0379"      # md-monitor
+GLYPH_BLUETOOTH = "\U000f00af"    # md-bluetooth
+GLYPH_HEADPHONES = "\U000f02cb"   # md-headphones
+GLYPH_KEYBOARD = "\U000f030c"     # md-keyboard
+GLYPH_MOUSE = "\U000f037d"        # md-mouse
+GLYPH_PHONE = "\U000f011c"        # md-cellphone
+GLYPH_USB = "\U000f0553"          # md-usb
+GLYPH_STORAGE = "\U000f129e"      # md-usb_flash_drive
+USB_ROOT = "/sys/bus/usb/devices"
+READ = safe.read_system_file      # tests read a fake tree through this
+OUTPUT_MAX = 1024 * 1024
+ROWS_MAX = 64
+MONITORS_MAX = 16
+BT_OBJECTS_MAX = 1024
+USB_ENTRIES_MAX = 1024
+INTERFACES_MAX = 32
+LOW_BATTERY = 20
+INTERNAL_PANELS = ("eDP", "LVDS", "DSI")
+# A device's directory is bus-port, then .port for every hub on the way: "3-1.4.2".
+USB_DEVICE = re.compile(r"[0-9]{1,3}-[0-9]{1,3}(?:\.[0-9]{1,3}){0,7}")
+USB_INTERFACE = re.compile(r"[0-9]{1,3}-[0-9]{1,3}(?:\.[0-9]{1,3}){0,7}:[0-9]{1,3}\.[0-9]{1,3}")
+HEX_MODEL = re.compile(r"0x[0-9A-Fa-f]+")
+ICONS = {"audio-headset": GLYPH_HEADPHONES, "audio-headphones": GLYPH_HEADPHONES, "audio-card": GLYPH_HEADPHONES,
+         "input-keyboard": GLYPH_KEYBOARD, "input-mouse": GLYPH_MOUSE, "input-tablet": GLYPH_MOUSE,
+         "phone": GLYPH_PHONE}
+
+
+def run_json(argv, timeout):
+    try:
+        r = safe.run(argv, timeout=timeout, max_output=OUTPUT_MAX)
+        if not r.ok:
+            return None
+        return safe.loads(r.stdout, max_depth=16, max_items=100000, max_string=16384)
+    except (OSError, ValueError, safe.UnsafeError):
+        return None
+
+
+# ------------------------------------------------------------------ displays
+
+def monitor_title(m):
+    make, model, description, serial = (common.clean_text(m.get(k), 128).strip() if isinstance(m.get(k), str) else ""
+                                        for k in ("make", "model", "description", "serial"))
+    if model and not HEX_MODEL.fullmatch(model):
+        brand = make.split()[0] if make else ""
+        return model if not brand or brand.lower() in model.lower() else f"{brand} {model}"
+    if description:
+        # A description is make, model and serial number; the serial is nobody's business at a glance.
+        return (description.replace(serial, "") if serial else description).strip()
+    return ""
+
+
+def display_rows(monitors):
+    rows = []
+    for m in monitors[:MONITORS_MAX] if isinstance(monitors, list) else []:
+        if not isinstance(m, dict) or not isinstance(m.get("name"), str) or not m["name"]:
+            continue
+        name = common.clean_text(m["name"], 32)
+        if name.startswith(INTERNAL_PANELS):
+            continue
+        off = m.get("disabled") is True
+        bits = [name]
+        if off:
+            bits.append("off")
+        else:
+            width, height, rate, scale = (common.number(m.get(k)) for k in ("width", "height", "refreshRate", "scale"))
+            if width > 0 and height > 0:
+                bits.append(f"{width:.0f}×{height:.0f}" + (f" @ {rate:.0f} Hz" if rate > 0 else ""))
+            if scale > 0 and abs(scale - 1) > 0.001:
+                bits.append(f"scale {scale:g}")
+            mirror = m.get("mirrorOf")
+            if isinstance(mirror, str) and mirror not in ("", "none"):
+                bits.append(f"mirrors {common.clean_text(mirror, 32)}")
+            if m.get("dpmsStatus") is False:
+                bits.append("asleep")
+        rows.append({"glyph": GLYPH_MONITOR, "title": monitor_title(m) or name, "detail": " · ".join(bits),
+                     "state": "idle" if off else "ok"})
+    return rows
+
+
+# ------------------------------------------------------------------ Bluetooth
+
+def prop(props, key):
+    entry = props.get(key) if isinstance(props, dict) else None
+    return entry.get("data") if isinstance(entry, dict) else None
+
+
+def bluetooth_rows(reply):
+    """Rows for the connected devices in busctl's JSON for GetManagedObjects:
+    {"type": "a{oa{sa{sv}}}", "data": [{object path: {interface: {property: {"type", "data"}}}}]}."""
+    data = reply.get("data") if isinstance(reply, dict) else None
+    objects = data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else {}
+    rows = []
+    for interfaces in list(objects.values())[:BT_OBJECTS_MAX]:
+        if not isinstance(interfaces, dict):
+            continue
+        device = interfaces.get("org.bluez.Device1")
+        if prop(device, "Connected") is not True:
+            continue
+        name = prop(device, "Alias") or prop(device, "Name")
+        icon = prop(device, "Icon")
+        battery = prop(interfaces.get("org.bluez.Battery1"), "Percentage")
+        bits, state = ["Bluetooth"], "ok"
+        if isinstance(battery, int) and not isinstance(battery, bool) and 0 <= battery <= 100:
+            bits.append(f"{battery}%")
+            if battery < LOW_BATTERY:
+                state = "warn"
+        rows.append({"glyph": ICONS.get(icon if isinstance(icon, str) else "", GLYPH_BLUETOOTH),
+                     "title": common.clean_text(name, 128) if isinstance(name, str) and name else "Bluetooth device",
+                     "detail": " · ".join(bits), "state": state})
+    return sorted(rows, key=lambda r: r["title"].lower())
+
+
+# ------------------------------------------------------------------ USB
+
+def attribute(entry, name, cap=256):
+    """One sysfs attribute of a USB device or interface, stripped, or ""."""
+    try:
+        blob = READ(f"{USB_ROOT}/{entry}/{name}", cap)
+    except (OSError, safe.UnsafeError):
+        return ""
+    return blob.decode("utf-8", "replace").strip() if blob else ""
+
+
+def usb_entries():
+    try:
+        with os.scandir(USB_ROOT) as it:
+            return [entry.name for _, entry in zip(range(USB_ENTRIES_MAX), it)]
+    except OSError:
+        return []
+
+
+def speed_text(value):
+    try:
+        mbps = float(value)
+    except ValueError:
+        return ""
+    if not 0 < mbps < 1e6:   # also refuses nan and inf
+        return ""
+    return f"{mbps / 1000:g} Gbps" if mbps >= 1000 else f"{mbps:g} Mbps"
+
+
+def usb_rows(entries):
+    devices = sorted({n for n in entries if USB_DEVICE.fullmatch(n)})
+    removable = {d: attribute(d, "removable") for d in devices}
+
+    def external(device):
+        for _ in range(8):
+            state = removable.get(device)
+            if state == "removable":
+                return True
+            if state != "unknown" or "." not in device:
+                return False
+            device = device.rsplit(".", 1)[0]   # the hub it is plugged into
+        return False
+
+    rows = []
+    for device in devices:
+        if len(rows) >= ROWS_MAX:
+            break
+        if not external(device):
+            continue
+        interfaces = [n for n in entries if n.startswith(device + ":") and USB_INTERFACE.fullmatch(n)][:INTERFACES_MAX]
+        classes = {attribute(n, "bInterfaceClass") for n in interfaces}
+        if attribute(device, "bDeviceClass") == "09" or "09" in classes:
+            continue
+        product = common.clean_text(attribute(device, "product"), 128)
+        vendor = common.clean_text(attribute(device, "manufacturer"), 64)
+        ids = ":".join(common.clean_text(attribute(device, k, 16), 8) for k in ("idVendor", "idProduct"))
+        title = product or (f"{vendor} {ids}" if vendor else f"USB device {ids}")
+        speed = speed_text(attribute(device, "speed", 32))
+        rows.append({"glyph": GLYPH_STORAGE if "08" in classes else GLYPH_USB, "title": title,
+                     "detail": "USB" + (f" · {speed}" if speed else ""), "state": "ok"})
+    return sorted(rows, key=lambda r: r["title"].lower())
+
+
+def main():
+    rows = display_rows(run_json(["hyprctl", "-j", "monitors", "all"], 3)) if safe.has_tool("hyprctl") else []
+    if safe.has_tool("busctl"):
+        # --auto-start=no: asking must not start bluetoothd on a machine where it is off.
+        rows += bluetooth_rows(run_json(["busctl", "--json=short", "--auto-start=no", "call", "org.bluez", "/",
+                                         "org.freedesktop.DBus.ObjectManager", "GetManagedObjects"], 3))
+    rows += usb_rows(usb_entries())
+    print(json.dumps({"section": "Devices", "glyph": GLYPH, "priority": 75, "intervalSec": 15, "timeoutSec": 8,
+                      "rows": rows[:ROWS_MAX]}, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

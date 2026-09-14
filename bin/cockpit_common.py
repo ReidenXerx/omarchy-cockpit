@@ -17,6 +17,7 @@ import plugin_safety as safe  # noqa: E402
 HOME = safe.home_dir()
 
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+PROC_START = re.compile(r"[0-9]{1,20}")
 
 
 def _under(path, anchor):
@@ -28,6 +29,12 @@ def state_dir():
     providers rewrite their files every second or two and every plugin_safety write
     fsyncs -- free in memory, real disk I/O anywhere else."""
     return pathlib.Path(safe.runtime_dir()) / "omarchy-cockpit"
+
+
+def persistent_dir():
+    """~/.local/state/omarchy-cockpit: what has to outlive a logout -- the rows you dismissed and the agent
+    sessions you may want back. Written when those change, never on a timer."""
+    return pathlib.Path(HOME) / ".local" / "state" / "omarchy-cockpit"
 
 
 def clean_text(value, limit):
@@ -90,6 +97,23 @@ def proc_read(pid, name, cap):
     except (OSError, safe.UnsafeError):
         return None
     return None if blob is None else blob.decode("utf-8", "replace")
+
+
+def proc_stat_fields(pid):
+    """/proc/<pid>/stat fields after the command name (state first), or None."""
+    content = proc_read(pid, "stat", 4096)
+    if not content or ")" not in content:
+        return None
+    return content[content.rfind(")") + 2:].split()
+
+
+def proc_start(pid):
+    """When the process started (field 22 of /proc/<pid>/stat, clock ticks since boot) as a string, or None. A pid
+    is reused once its process exits; the start time is what tells the two apart."""
+    fields = proc_stat_fields(pid)
+    if fields is None or len(fields) <= 19 or not PROC_START.fullmatch(fields[19]):
+        return None
+    return fields[19]
 
 
 def open_files(pid, limit=FD_SCAN_MAX, with_stat=True):
@@ -204,18 +228,33 @@ def git_command(repo, *args, timeout=4):
 
 # ------------------------------------------------------------------ actions
 
-# A row's action is data, never a command line. Three kinds exist:
+# A row's action is data, never a command line. The kinds:
 #   {"kind": "focus-window", "address": "0x55d0c0ffee"}
-#   {"kind": "terminal", "argv": ["git", "-C", "/home/me/repo", "status"]}
-#   {"kind": "run",      "argv": ["udisksctl", "mount", "-b", "/dev/sda1"]}
+#   {"kind": "terminal",     "argv": ["git", "-C", "/home/me/repo", "status"]}
+#   {"kind": "run",          "argv": ["udisksctl", "mount", "-b", "/dev/sda1"]}
+#   {"kind": "open-url",     "url": "http://127.0.0.1:5173/"}             loopback only
+#   {"kind": "open-folder",  "path": "/home/me/src/api"}                  inside your home
+#   {"kind": "stop-process", "pid": 4121, "start": "8812734"}             yours, and still that process
+#   {"kind": "resume-agent", "session": "<uuid>", "cwd": "/home/me/src/api"}
+#   {"kind": "dismiss",      "provider": "40-git", "key": "...", "marker": "..."}   the runner's own
+#   {"kind": "undismiss",    "provider": "40-git"}                                   the runner's own
 # argv[0] must be one of TOOLS and the rest must match one of that tool's shapes, so data
 # a provider interpolates (a host, a device, a repo path) can only fill the slot meant for
 # it -- never become an option or a second command.
 ACTION_MAX = 8 * 1024
 ARG_MAX = 512
 ARGV_MAX = 16
-KINDS = ("focus-window", "terminal", "run")
+KINDS = ("focus-window", "terminal", "run", "open-url", "open-folder", "stop-process", "resume-agent",
+         "dismiss", "undismiss")
+# Only the runner makes these, for the rows it can hide; from a provider they are refused.
+RUNNER_KINDS = ("dismiss", "undismiss")
 ADDRESS = re.compile(r"0x[0-9a-fA-F]{1,16}")
+LOCAL_URL = re.compile(r"http://(?:127\.0\.0\.1|localhost|\[::1\]):([1-9][0-9]{0,4})(?:/[A-Za-z0-9._~/-]*)?")
+SESSION_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+PROVIDER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+DISMISS_KEY_MAX = 256
+DISMISS_MARKER_MAX = 128
+PID_MAX = 4194304
 
 _HOST = r"[A-Za-z0-9][A-Za-z0-9.:-]{0,252}"
 _DEVICE = r"/dev/[A-Za-z0-9][A-Za-z0-9_.:+-]*(?:/[A-Za-z0-9][A-Za-z0-9_.:+-]*)*"
@@ -242,6 +281,33 @@ class ActionError(ValueError):
     pass
 
 
+def dismiss_key(value):
+    """A row's dismissal key (a repo path, a session id), or None."""
+    if not isinstance(value, str) or not 0 < len(value) <= DISMISS_KEY_MAX or _CONTROL.search(value):
+        return None
+    return value
+
+
+def dismiss_marker(value):
+    """What the row looked like when dismissed, as its provider sums it up; may be empty. None if unusable."""
+    if not isinstance(value, str) or len(value) > DISMISS_MARKER_MAX or _CONTROL.search(value):
+        return None
+    return value
+
+
+def focus_window_argv(address):
+    """hyprctl's argv to focus a window. Hyprland 0.56 dispatchers are Lua; the address has to
+    match 0x[0-9a-fA-F]{1,16}, so nothing else can reach the expression."""
+    if not isinstance(address, str) or not ADDRESS.fullmatch(address):
+        raise ActionError("focus-window address must match 0x[0-9a-fA-F]{1,16}")
+    return ["hyprctl", "dispatch", 'hl.dsp.focus({ window = "address:%s" })' % address]
+
+
+def _fields(action, kind, *names):
+    if set(action) != {"kind", *names}:
+        raise ActionError(f"{kind} takes exactly kind and {', '.join(names)}")
+
+
 def validate_action(action):
     """The action, normalised, or ActionError."""
     if not isinstance(action, dict):
@@ -256,6 +322,46 @@ def validate_action(action):
         if not isinstance(address, str) or not ADDRESS.fullmatch(address):
             raise ActionError("focus-window address must match 0x[0-9a-fA-F]{1,16}")
         return {"kind": kind, "address": address}
+    if kind == "open-url":
+        _fields(action, kind, "url")
+        url = action.get("url")
+        match = LOCAL_URL.fullmatch(url) if isinstance(url, str) else None
+        if match is None or int(match.group(1)) > 65535:
+            raise ActionError("open-url takes only http://127.0.0.1, localhost or [::1] with a port")
+        return {"kind": kind, "url": url}
+    if kind == "open-folder":
+        _fields(action, kind, "path")
+        if home_path(action.get("path")) is None:
+            raise ActionError("open-folder path must be an absolute, normalised path inside your home directory")
+        return {"kind": kind, "path": action["path"]}
+    if kind == "stop-process":
+        _fields(action, kind, "pid", "start")
+        pid, start = action.get("pid"), action.get("start")
+        if isinstance(pid, bool) or not isinstance(pid, int) or not 2 <= pid <= PID_MAX:
+            raise ActionError("stop-process pid must be a process id")
+        if not isinstance(start, str) or not PROC_START.fullmatch(start):
+            raise ActionError("stop-process start must be the process start time from /proc/<pid>/stat")
+        return {"kind": kind, "pid": pid, "start": start}
+    if kind == "resume-agent":
+        _fields(action, kind, "session", "cwd")
+        session = action.get("session")
+        if not isinstance(session, str) or not SESSION_ID.fullmatch(session):
+            raise ActionError("resume-agent session must be a session id")
+        if home_path(action.get("cwd")) is None:
+            raise ActionError("resume-agent cwd must be an absolute, normalised path inside your home directory")
+        return {"kind": kind, "session": session, "cwd": action["cwd"]}
+    if kind in RUNNER_KINDS:
+        names = ("provider", "key", "marker") if kind == "dismiss" else ("provider",)
+        _fields(action, kind, *names)
+        provider = action.get("provider")
+        if not isinstance(provider, str) or not PROVIDER_NAME.fullmatch(provider):
+            raise ActionError(f"{kind} provider must be a provider name")
+        if kind == "undismiss":
+            return {"kind": kind, "provider": provider}
+        if dismiss_key(action.get("key")) is None or dismiss_marker(action.get("marker")) is None:
+            raise ActionError(f"dismiss key must be 1..{DISMISS_KEY_MAX} and marker 0..{DISMISS_MARKER_MAX} "
+                              "characters without control characters")
+        return {"kind": kind, "provider": provider, "key": action["key"], "marker": action["marker"]}
     if set(action) != {"kind", "argv"}:
         raise ActionError(f"{kind} takes exactly kind and argv")
     argv = action.get("argv")

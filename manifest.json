@@ -2,20 +2,20 @@
   "schemaVersion": 1,
   "id": "reidenxerx.cockpit",
   "name": "Cockpit",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "author": "ReidenXerx",
   "license": "MIT",
-  "description": "One hub for what the machine is doing right now: which AI sessions are working, waiting for you or idle, file transfers with real progress, long-running jobs, dirty repos, pending updates. Extensible with your own providers.",
+  "description": "One hub for what the machine is doing right now: which AI sessions are working, waiting for you or done (and a finished chat back in one click), file transfers with real progress, long-running jobs, repos with work on one disk only, listening ports and the processes behind them, network links and connected devices. Extensible with your own providers.",
   "kinds": ["bar-widget"],
   "entryPoints": { "barWidget": "BarWidget.qml" },
   "barWidget": {
     "displayName": "Cockpit",
-    "description": "At-a-glance status hub: agents, transfers, jobs, git, updates",
+    "description": "At-a-glance status hub: agents, transfers, jobs, git, ports, network, devices",
     "category": "System",
-    "aliases": ["cockpit", "status", "hub", "activity", "agents", "transfers", "dashboard"],
+    "aliases": ["cockpit", "status", "hub", "activity", "agents", "transfers", "dashboard", "ports", "network", "devices"],
     "allowMultiple": false,
     "defaultSection": "right",
-    "defaults": { "rowsPerSection": 6, "refreshSec": 3 },
+    "defaults": { "rowsPerSection": 6, "refreshSec": 3, "agentAlerts": true },
     "schema": [
       {
         "key": "rowsPerSection",
@@ -32,6 +32,13 @@
         "min": 1, "max": 30, "step": 1,
         "defaultValue": 3,
         "description": "How often the hub re-runs its providers while it is open. Each provider also declares its own cadence, so an expensive one is not re-run just because this ticked."
+      },
+      {
+        "key": "agentAlerts",
+        "type": "boolean",
+        "label": "Notify me about agents",
+        "defaultValue": true,
+        "description": "A notification when a Claude Code session starts waiting for you, or finishes a turn that took more than a minute, unless its window is the one you are in. Show takes you there."
       }
     ]
   }

@@ -1,0 +1,228 @@
+#!/usr/bin/python3
+"""How this machine is connected: the link each network device is on, and whether it
+actually reaches the internet.
+
+A Wi-Fi row carries the network's name, its signal, the link rate and your address on it; a
+wired row its negotiated speed; a VPN its address. When NetworkManager finds the internet
+unreachable, limited, or behind a captive portal, a warning leads the section -- being
+"connected" to a hotel network that wants a login first is exactly the case worth a glance.
+Loopback, container and VM bridges and the Tailscale interface are left out (the Tailnet
+section covers Tailscale). Nothing here scans: the Wi-Fi list is what NetworkManager already
+knows. Without NetworkManager the kernel's view is used instead: every interface that is up
+and has an address.
+"""
+import json
+import os
+import pathlib
+import re
+import sys
+import time
+
+sys.dont_write_bytecode = True  # no __pycache__ in the plugin (the shell watches it)
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "bin"))
+import plugin_safety as safe  # noqa: E402
+import cockpit_common as common  # noqa: E402
+
+GLYPH = "\U000f059f"          # md-web
+GLYPH_WIFI = "\U000f05a9"     # md-wifi
+GLYPH_OFFLINE = "\U000f05aa"  # md-wifi_off
+GLYPH_WIRED = "\U000f0200"    # md-ethernet
+GLYPH_VPN = "\U000f0582"      # md-vpn
+NET_ROOT = "/sys/class/net"
+READ = safe.read_system_file    # tests read a fake tree through this
+OUTPUT_MAX = 256 * 1024
+IP_OUTPUT_MAX = 1024 * 1024
+LINES_MAX = 256
+ROWS_MAX = 32
+# Inside the 8 s this provider declares, leaving room for interpreter start-up.
+DEADLINE = 6.0
+WEAK_SIGNAL = 30
+IFNAME = re.compile(r"[A-Za-z0-9_.@-]{1,15}")
+SKIP_PREFIXES = ("tailscale", "docker", "br-", "veth", "virbr", "vnet", "vmnet", "vboxnet", "p2p-dev", "podman",
+                 "cni", "lxcbr", "lxdbr")
+SKIP_TYPES = {"loopback", "bridge", "veth", "wifi-p2p", "dummy"}
+VPN_TYPES = {"wireguard", "vpn", "tun", "tap", "ip-tunnel", "macsec"}
+CONNECTIVITY = {
+    "none": ("No internet", "NetworkManager reaches nothing beyond this network"),
+    "portal": ("Sign in to this network", "a captive portal stands between you and the internet"),
+    "limited": ("Limited connectivity", "connected, but the internet is not reachable"),
+}
+
+
+def run_text(argv, budget, cap=OUTPUT_MAX):
+    if budget < 0.5:
+        return None
+    try:
+        r = safe.run(argv, timeout=budget, max_output=cap)
+    except (OSError, safe.UnsafeError):
+        return None
+    return r.text() if r.ok else None
+
+
+def terse_fields(line):
+    """The fields of one `nmcli -t -e yes` line: ":" separates them, "\\:" and "\\\\" are escaped."""
+    fields, current, i = [], [], 0
+    while i < len(line):
+        ch = line[i]
+        if ch == "\\" and i + 1 < len(line):
+            current.append(line[i + 1])
+            i += 2
+            continue
+        if ch == ":":
+            fields.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+        i += 1
+    fields.append("".join(current))
+    return fields
+
+
+def skipped(name, kind=""):
+    return (name == "lo" or name.startswith(SKIP_PREFIXES) or kind in SKIP_TYPES
+            or not IFNAME.fullmatch(name) or name in (".", ".."))
+
+
+def addresses(data):
+    """{interface: its first global IPv4 address, else its first global IPv6} from `ip -j addr`."""
+    out = {}
+    for link in data if isinstance(data, list) else []:
+        if not isinstance(link, dict) or not isinstance(link.get("ifname"), str):
+            continue
+        v4 = v6 = None
+        for a in link.get("addr_info") if isinstance(link.get("addr_info"), list) else []:
+            if not isinstance(a, dict) or a.get("scope") != "global" or not isinstance(a.get("local"), str):
+                continue
+            if a.get("family") == "inet" and v4 is None:
+                v4 = a["local"]
+            elif a.get("family") == "inet6" and v6 is None:
+                v6 = a["local"]
+        if v4 or v6:
+            out[link["ifname"]] = common.clean_text(v4 or v6, 64)
+    return out
+
+
+def link_speed(name):
+    """A wired link's negotiated speed from sysfs, or "" (a link that is down has none)."""
+    try:
+        mbps = int((READ(f"{NET_ROOT}/{name}/speed", 32) or b"").strip())
+    except (OSError, ValueError, safe.UnsafeError):
+        return ""
+    if mbps <= 0:
+        return ""
+    return f"{mbps / 1000:g} Gb/s" if mbps >= 1000 else f"{mbps} Mb/s"
+
+
+def number(text):
+    return int(text) if text.isdigit() and len(text) <= 6 else None
+
+
+def device_row(device, kind, connection, wifi, address):
+    name = common.clean_text(device, 16)
+    label = common.clean_text(connection, 128)
+    bits, state = [name], "ok"
+    if kind == "wifi":
+        glyph = GLYPH_WIFI
+        title = common.clean_text(wifi[2], 128) if wifi and wifi[2] else (label or name)
+        signal = number(wifi[3]) if wifi else None
+        if signal is not None and signal <= 100:
+            bits.append(f"{signal}%")
+            if signal < WEAK_SIGNAL:
+                state = "warn"
+        if wifi and wifi[4]:
+            bits.append(common.clean_text(wifi[4], 16))
+    elif kind == "ethernet":
+        glyph, title = GLYPH_WIRED, label or name
+        speed = link_speed(device)
+        if speed:
+            bits.append(speed)
+    elif kind in VPN_TYPES:
+        glyph, title = GLYPH_VPN, label or name
+    else:
+        glyph, title = GLYPH, label or name
+        bits.append(common.clean_text(kind, 24))
+    if address:
+        bits.append(address)
+    return {"glyph": glyph, "title": title, "detail": " · ".join(bits), "state": state}
+
+
+def nm_rows(addrs, left):
+    """Rows from NetworkManager, or None when nmcli could not answer (then the kernel is asked)."""
+    status = run_text(["nmcli", "-t", "-e", "yes", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device", "status"], left())
+    if status is None:
+        return None
+    wifi = {}
+    listing = run_text(["nmcli", "-t", "-e", "yes", "-f", "ACTIVE,DEVICE,SSID,SIGNAL,RATE", "device", "wifi", "list",
+                        "--rescan", "no"], left())
+    for line in (listing or "").splitlines()[:LINES_MAX]:
+        fields = terse_fields(line)
+        if len(fields) == 5 and fields[0] == "yes" and fields[1] not in wifi:
+            wifi[fields[1]] = fields
+    connectivity = (run_text(["nmcli", "-t", "networking", "connectivity"], left()) or "").strip()
+    rows = []
+    if connectivity in CONNECTIVITY:
+        title, detail = CONNECTIVITY[connectivity]
+        rows.append({"glyph": GLYPH_OFFLINE, "title": title, "detail": detail, "state": "warn"})
+    for line in status.splitlines()[:LINES_MAX]:
+        fields = terse_fields(line)
+        if len(fields) != 4:
+            continue
+        device, kind, state, connection = fields
+        if not state.startswith("connected") or skipped(device, kind):
+            continue
+        rows.append(device_row(device, kind, connection, wifi.get(device), addrs.get(device)))
+    return rows[:ROWS_MAX]
+
+
+def is_wireless(name):
+    return os.path.isdir(f"{NET_ROOT}/{name}/wireless")
+
+
+def kernel_rows(data):
+    """Without NetworkManager: the interfaces that are up and have a global address."""
+    addrs, rows = addresses(data), []
+    for link in data if isinstance(data, list) else []:
+        if len(rows) >= ROWS_MAX:
+            break
+        name = link.get("ifname") if isinstance(link, dict) else None
+        flags = link.get("flags") if isinstance(link, dict) and isinstance(link.get("flags"), list) else []
+        if not isinstance(name, str) or skipped(name) or "UP" not in flags or "LOWER_UP" not in flags \
+                or name not in addrs:
+            continue
+        if is_wireless(name):
+            glyph, bits = GLYPH_WIFI, ["Wi-Fi"]
+        elif link.get("link_type") == "none" or "POINTOPOINT" in flags:
+            glyph, bits = GLYPH_VPN, ["tunnel"]
+        else:
+            speed = link_speed(name)
+            glyph, bits = GLYPH_WIRED, ["wired"] + ([speed] if speed else [])
+        rows.append({"glyph": glyph, "title": common.clean_text(name, 16), "detail": " · ".join(bits + [addrs[name]]),
+                     "state": "ok"})
+    return rows
+
+
+def ip_links(budget):
+    text = run_text(["ip", "-j", "addr", "show"], budget, IP_OUTPUT_MAX)
+    try:
+        data = safe.loads(text, max_depth=12, max_items=50000, max_string=4096) if text else []
+    except (ValueError, safe.UnsafeError):
+        return []
+    return data if isinstance(data, list) else []
+
+
+def main():
+    start = time.monotonic()
+
+    def left(cap=3.0):
+        return max(0.0, min(cap, DEADLINE - (time.monotonic() - start)))
+
+    links = ip_links(left()) if safe.has_tool("ip") else []
+    rows = nm_rows(addresses(links), left) if safe.has_tool("nmcli") else None
+    if rows is None:
+        rows = kernel_rows(links)
+    print(json.dumps({"section": "Network", "glyph": GLYPH, "priority": 72, "intervalSec": 15, "timeoutSec": 8,
+                      "rows": rows[:ROWS_MAX]}, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
