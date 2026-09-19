@@ -42,9 +42,26 @@ Panel {
 
   // ---------------------------------------------------------------- data
 
+  // A child process starts with whatever the shell was started with, and the shell is
+  // long-lived, so LD_PRELOAD, PYTHONPATH and PYTHONHOME would all reach an interpreter
+  // this plugin then trusts. Each helper is handed an explicit environment instead, and
+  // python runs isolated on top of it (-I); the helpers put their own directory on
+  // sys.path themselves, so nothing depends on -P's default.
+  readonly property var childEnv: {
+    const env = { "PATH": "/usr/bin:/bin", "PYTHONIOENCODING": "utf-8" }
+    for (const name of ["HOME", "LANG", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME",
+                        "XDG_DATA_HOME", "HYPRLAND_INSTANCE_SIGNATURE"]) {
+      const value = Quickshell.env(name)
+      if (value) env[name] = value
+    }
+    return env
+  }
+
   Process {
     id: runner
-    command: [root.python, root.pluginBin + "cockpit"]
+    clearEnvironment: true
+    environment: root.childEnv
+    command: [root.python, "-I", root.pluginBin + "cockpit"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -104,8 +121,10 @@ Panel {
   // autostart entry so it dies with the shell.
   Process {
     id: agentd
-    command: root.agentAlerts ? [root.python, root.pluginBin + "cockpit-agentd"]
-                              : [root.python, root.pluginBin + "cockpit-agentd", "--no-alerts"]
+    clearEnvironment: true
+    environment: root.childEnv
+    command: root.agentAlerts ? [root.python, "-I", root.pluginBin + "cockpit-agentd"]
+                              : [root.python, "-I", root.pluginBin + "cockpit-agentd", "--no-alerts"]
     running: true
     // It exits when Hyprland's socket closes or another copy already holds it; try again
     // later rather than losing busy-detection until the shell restarts.
@@ -155,9 +174,11 @@ Panel {
   // a resumed chat -- because those must outlive the helper.
   Process {
     id: actionProc
+    clearEnvironment: true
+    environment: root.childEnv
     property string payload: ""
     property string kind: ""
-    command: [root.python, root.pluginBin + "cockpit", "action"]
+    command: [root.python, "-I", root.pluginBin + "cockpit", "action"]
     stdinEnabled: true
     stdout: StdioCollector {
       waitForEnd: true
@@ -304,11 +325,17 @@ Panel {
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: Style.space(7)
                 Text {
+                  // Window titles, SSIDs and process names are strings the system
+                  // handed us. Rendered literally, never interpreted as markup.
+                  textFormat: Text.PlainText
                   text: line.modelData.glyph || ""
                   color: Color.accent
                   font.pixelSize: Style.font.bodySmall
                 }
                 Text {
+                  // Window titles, SSIDs and process names are strings the system
+                  // handed us. Rendered literally, never interpreted as markup.
+                  textFormat: Text.PlainText
                   text: line.modelData.section || ""
                   color: root.barForeground
                   opacity: 0.9
@@ -316,6 +343,9 @@ Panel {
                   font.bold: true
                 }
                 Text {
+                  // Window titles, SSIDs and process names are strings the system
+                  // handed us. Rendered literally, never interpreted as markup.
+                  textFormat: Text.PlainText
                   text: line.modelData.count ? line.modelData.count : ""
                   color: root.barForeground
                   opacity: 0.4
@@ -323,6 +353,9 @@ Panel {
                 }
                 // Rows you dismissed stay counted here, and a click brings them all back.
                 Text {
+                  // Window titles, SSIDs and process names are strings the system
+                  // handed us. Rendered literally, never interpreted as markup.
+                  textFormat: Text.PlainText
                   visible: (line.modelData.dismissed || 0) > 0
                   text: dismissedArea.containsMouse ? "bring back " + line.modelData.dismissed
                                                     : line.modelData.dismissed + " dismissed"
@@ -343,6 +376,9 @@ Panel {
 
               // ---- "+N more"
               Text {
+                // Window titles, SSIDs and process names are strings the system
+                // handed us. Rendered literally, never interpreted as markup.
+                textFormat: Text.PlainText
                 visible: line.modelData.kind === "more"
                 anchors.verticalCenter: parent.verticalCenter
                 x: Style.space(26)
@@ -366,6 +402,9 @@ Panel {
                   spacing: Style.space(8)
 
                   Text {
+                    // Window titles, SSIDs and process names are strings the system
+                    // handed us. Rendered literally, never interpreted as markup.
+                    textFormat: Text.PlainText
                     text: line.modelData.glyph || ""
                     // "needs" (an agent waiting on you) and "warn" (true all day) share the
                     // urgent tint; only "needs" also colours its detail line and the bar dot.
@@ -382,6 +421,9 @@ Panel {
                     spacing: 0
 
                     Text {
+                      // Window titles, SSIDs and process names are strings the system
+                      // handed us. Rendered literally, never interpreted as markup.
+                      textFormat: Text.PlainText
                       Layout.fillWidth: true
                       text: line.modelData.title || ""
                       color: root.barForeground
@@ -413,6 +455,9 @@ Panel {
                       // The detail, or what the hovered button does, or the question a pressed
                       // one is asking.
                       Text {
+                        // Window titles, SSIDs and process names are strings the system
+                        // handed us. Rendered literally, never interpreted as markup.
+                        textFormat: Text.PlainText
                         Layout.fillWidth: true
                         text: line.asking ? line.asking.confirm : (line.buttonHint || line.modelData.detail || "")
                         color: (line.asking || line.modelData.state === "needs") ? Color.urgent : root.barForeground
@@ -443,6 +488,9 @@ Panel {
                           ? Style.hoverFillFor(root.barForeground, chip.armed ? Color.urgent : Color.accent) : "transparent"
 
                         Text {
+                          // Window titles, SSIDs and process names are strings the system
+                          // handed us. Rendered literally, never interpreted as markup.
+                          textFormat: Text.PlainText
                           anchors.centerIn: parent
                           text: chip.modelData.glyph || "?"
                           color: chip.armed ? Color.urgent : root.barForeground
@@ -470,6 +518,9 @@ Panel {
           }
 
           Text {
+            // Window titles, SSIDs and process names are strings the system
+            // handed us. Rendered literally, never interpreted as markup.
+            textFormat: Text.PlainText
             Layout.fillWidth: true
             visible: root.display.length === 0
             horizontalAlignment: Text.AlignHCenter
