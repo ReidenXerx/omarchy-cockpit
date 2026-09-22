@@ -21,7 +21,12 @@ import plugin_safety as safe  # noqa: E402
 import cockpit_common as common  # noqa: E402
 
 # Packages whose update is only actually in effect after a reboot.
-CRITICAL = ("linux", "linux-lts", "linux-zen", "nvidia", "nvidia-open", "nvidia-dkms",
+#
+# Kernels are deliberately not in this list. Updating a kernel you do not boot owes you
+# nothing, and on a machine that boots something other than `linux` -- linux-omarchy here,
+# but -lts and -zen are the same story -- counting every kernel would nag forever. The one
+# kernel that matters is the running one, handled by running_kernel_package() below.
+CRITICAL = ("nvidia", "nvidia-open", "nvidia-dkms", "nvidia-open-dkms",
             "systemd", "intel-ucode", "amd-ucode", "mesa")
 PACMAN_LOCAL = "/var/lib/pacman/local"
 LOCAL_ENTRIES_MAX = 50000
@@ -34,6 +39,29 @@ def pacman_version(pkg):
         return ""
     parts = r.text().split()
     return parts[1] if r.ok and len(parts) >= 2 else ""
+
+
+def running_kernel_package():
+    """The package providing the running kernel, or "" if nothing owns it.
+
+    Asking pacman who owns the running kernel's modules beats assuming `linux`: this
+    machine boots linux-omarchy on purpose, so comparing against `linux` reported a
+    reboot was owed every minute of every day.
+    """
+    modules = pathlib.Path("/usr/lib/modules") / os.uname().release
+    if not modules.is_dir():
+        return None          # the running kernel has been replaced on disk
+    try:
+        r = safe.run(["pacman", "-Qoq", str(modules)], timeout=4, max_output=4096)
+    except (OSError, safe.UnsafeError):
+        return ""
+    if not r.ok:
+        return ""
+    # Two packages own that directory: the kernel and its -headers, which puts build/
+    # there. Order is not guaranteed, so pick by name rather than by luck.
+    owners = [n.strip() for n in r.text().strip().splitlines() if n.strip()]
+    kernels = [n for n in owners if not n.endswith(("-headers", "-docs"))]
+    return (kernels or owners or [""])[0]
 
 
 def normalise(v):
@@ -67,13 +95,22 @@ def installed_at(packages):
 
 def main():
     running = os.uname().release
-    installed = pacman_version("linux")
+    pkg = running_kernel_package()
     up = common.uptime()
 
-    kernel_stale = bool(installed) and normalise(installed) not in normalise(running)
+    if pkg is None:
+        # No module directory for the kernel we are running: it was replaced underneath
+        # us, which is the one case where a reboot is unarguable.
+        installed, kernel_stale = "", True
+    elif pkg:
+        installed = pacman_version(pkg)
+        kernel_stale = bool(installed) and normalise(installed) not in normalise(running)
+    else:
+        # Owned by nothing -- a hand-built kernel. Not our business to nag about.
+        installed, kernel_stale = "", False
 
     now = time.time()
-    stamps = installed_at([p for p in CRITICAL if p != "linux"])
+    stamps = installed_at(CRITICAL)
     stale_pkgs = [pkg for pkg, at in stamps.items() if at and up and (now - at) < up]
 
     rows = []
@@ -82,7 +119,7 @@ def main():
         # and listing them separately makes a single condition look like three problems.
         what = []
         if kernel_stale:
-            what.append(f"kernel {installed}")
+            what.append(f"kernel {installed or 'replaced'}")
         what.extend(stale_pkgs)
         rows.append({
             "glyph": "󰜉",
