@@ -1,5 +1,6 @@
 import QtQuick
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 
 BarWidget {
@@ -56,7 +57,7 @@ BarWidget {
     // No slotSize override: BarIconButton defaults to Style.bar.iconSlot (27), which is
     // what the rest of the bar uses. statusSlot is 21, and setting it made this widget
     // six logical pixels narrower than its neighbours -- visible as a tighter gap.
-    foreground: root.bar ? root.bar.barForeground : Color.foreground
+    foreground: root.bar ? root.bar.barForeground : Commons.Color.foreground
     tooltipText: panelLoader.item ? panelLoader.item.summaryText : "Cockpit"
     onPressed: function (b) { root.togglePanel() }
 
@@ -70,7 +71,7 @@ BarWidget {
       width: Style.space(6)
       height: width
       radius: width / 2
-      color: root.needsCount > 0 ? Color.urgent : Color.accent
+      color: root.needsCount > 0 ? Commons.Color.urgent : Commons.Color.accent
       anchors.right: parent.right
       anchors.top: parent.top
       anchors.rightMargin: Style.space(3)

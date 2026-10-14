@@ -4,6 +4,7 @@ import QtQuick.Layouts
 import Quickshell
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 import "CockpitModel.js" as Model
 
@@ -329,7 +330,7 @@ Panel {
                   // handed us. Rendered literally, never interpreted as markup.
                   textFormat: Text.PlainText
                   text: line.modelData.glyph || ""
-                  color: Color.accent
+                  color: Commons.Color.accent
                   font.pixelSize: Style.font.bodySmall
                 }
                 Text {
@@ -359,7 +360,7 @@ Panel {
                   visible: (line.modelData.dismissed || 0) > 0
                   text: dismissedArea.containsMouse ? "bring back " + line.modelData.dismissed
                                                     : line.modelData.dismissed + " dismissed"
-                  color: dismissedArea.containsMouse ? Color.accent : root.barForeground
+                  color: dismissedArea.containsMouse ? Commons.Color.accent : root.barForeground
                   opacity: dismissedArea.containsMouse ? 1.0 : 0.4
                   font.pixelSize: Style.font.caption
 
@@ -393,7 +394,7 @@ Panel {
                 visible: line.modelData.kind === "row"
                 anchors.fill: parent
                 radius: Style.cornerRadius
-                color: lineHover.hovered ? Style.hoverFillFor(root.barForeground, Color.accent) : "transparent"
+                color: lineHover.hovered ? Style.hoverFillFor(root.barForeground, Commons.Color.accent) : "transparent"
 
                 RowLayout {
                   anchors.fill: parent
@@ -408,8 +409,8 @@ Panel {
                     text: line.modelData.glyph || ""
                     // "needs" (an agent waiting on you) and "warn" (true all day) share the
                     // urgent tint; only "needs" also colours its detail line and the bar dot.
-                    color: line.modelData.state === "busy" ? Color.accent
-                         : ((line.modelData.state === "warn" || line.modelData.state === "needs") ? Color.urgent : root.barForeground)
+                    color: line.modelData.state === "busy" ? Commons.Color.accent
+                         : ((line.modelData.state === "warn" || line.modelData.state === "needs") ? Commons.Color.urgent : root.barForeground)
                     opacity: line.modelData.state === "idle" ? 0.55 : 1.0
                     font.pixelSize: Style.font.body
                     horizontalAlignment: Text.AlignHCenter
@@ -447,7 +448,7 @@ Panel {
                           width: parent.width * ((line.modelData.progress || 0) / 100)
                           height: parent.height
                           radius: height / 2
-                          color: Color.accent
+                          color: Commons.Color.accent
                           Behavior on width { NumberAnimation { duration: 220; easing.type: Easing.OutCubic } }
                         }
                       }
@@ -460,7 +461,7 @@ Panel {
                         textFormat: Text.PlainText
                         Layout.fillWidth: true
                         text: line.asking ? line.asking.confirm : (line.buttonHint || line.modelData.detail || "")
-                        color: (line.asking || line.modelData.state === "needs") ? Color.urgent : root.barForeground
+                        color: (line.asking || line.modelData.state === "needs") ? Commons.Color.urgent : root.barForeground
                         opacity: (line.asking || line.modelData.state === "needs") ? 0.9 : (line.buttonHint ? 0.8 : 0.5)
                         font.pixelSize: Style.font.caption
                         elide: Text.ElideRight
@@ -485,7 +486,7 @@ Panel {
                         height: Style.space(26)
                         radius: Style.cornerRadius
                         color: (chipArea.containsMouse || chip.armed)
-                          ? Style.hoverFillFor(root.barForeground, chip.armed ? Color.urgent : Color.accent) : "transparent"
+                          ? Style.hoverFillFor(root.barForeground, chip.armed ? Commons.Color.urgent : Commons.Color.accent) : "transparent"
 
                         Text {
                           // Window titles, SSIDs and process names are strings the system
@@ -493,7 +494,7 @@ Panel {
                           textFormat: Text.PlainText
                           anchors.centerIn: parent
                           text: chip.modelData.glyph || "?"
-                          color: chip.armed ? Color.urgent : root.barForeground
+                          color: chip.armed ? Commons.Color.urgent : root.barForeground
                           opacity: (chipArea.containsMouse || chip.armed) ? 1.0 : 0.65
                           font.pixelSize: Style.font.body
                         }
@@ -539,7 +540,7 @@ Panel {
             delegate: Text {
               Layout.fillWidth: true
               text: "! " + modelData
-              color: Color.urgent
+              color: Commons.Color.urgent
               opacity: 0.75
               font.pixelSize: Style.font.caption
               elide: Text.ElideRight
