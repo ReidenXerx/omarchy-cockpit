@@ -16,6 +16,7 @@ changed. A spinner goes quiet during a long tool call, so those rows say "last a
 rather than claiming the agent is idle.
 """
 import json
+import os
 import pathlib
 import stat
 import sys
@@ -115,7 +116,9 @@ def session_row(session, window, now):
             task = text
         where = f"ws{window['ws']}"
     else:
-        where = "background" if session["kind"] not in ("", "interactive") else "no window"
+        # Without Hyprland (Plasma) windows are never looked up, so "no window" would say something untrue.
+        where = ("background" if session["kind"] not in ("", "interactive")
+                 else "no window" if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") else "")
     row = {
         "glyph": STATUS_GLYPHS.get(status, OTHER_GLYPH),
         "title": common.clean_text(task or session["name"] or agents.project_of(session["cwd"]) or "Claude Code",

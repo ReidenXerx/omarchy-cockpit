@@ -326,6 +326,17 @@ class NewActions(Sandbox):
             self.assertEqual(self.resume(cwd), {"exec": [
                 "/usr/bin/konsole", "--workdir", str(cwd), "-e", str(claude), "--resume", SESSION]})
 
+    def test_the_plasma_widget_gets_plain_launches_even_where_uwsm_is_installed(self):
+        claude, cwd, _ = self.resume_fixture()
+        tools = {"uwsm-app": "/usr/bin/uwsm-app", "xdg-terminal-exec": "/usr/bin/xdg-terminal-exec",
+                 "xdg-open": "/usr/bin/xdg-open"}
+        with mock.patch.object(safe, "has_tool", lambda name: name in tools), \
+             mock.patch.object(safe, "tool", lambda name: tools[name]), \
+             mock.patch.dict(os.environ, {"COCKPIT_PLAIN_LAUNCH": "1"}):
+            self.assertEqual(self.resume(cwd)["exec"][0], "/usr/bin/xdg-terminal-exec")
+            folder = cockpit.perform(common.validate_action({"kind": "open-folder", "path": str(cwd)}))
+            self.assertEqual(folder, {"exec": ["/usr/bin/xdg-open", str(cwd)]})
+
     def test_resuming_refuses_a_missing_chat_folder_or_an_untrusted_claude(self):
         claude, cwd, transcript = self.resume_fixture()
         transcript.unlink()

@@ -506,6 +506,13 @@ def stop_process(pid, start):
             pass
 
 
+def plain_launch():
+    """Launch without uwsm and Omarchy's presentation terminal: when the caller says so (the Plasma widget sets
+    COCKPIT_PLAIN_LAUNCH=1, since uwsm being installed does not mean this session runs under it), or when uwsm is
+    not installed at all."""
+    return os.environ.get("COCKPIT_PLAIN_LAUNCH") == "1" or not safe.has_tool("uwsm-app")
+
+
 def claude_program():
     """Claude Code's launcher: yours when it is a file you own that nobody else can write, else a system one."""
     for path in CLAUDE_PROGRAMS:
@@ -543,7 +550,7 @@ def resume_agent(session, cwd):
     # detached through uwsm by the panel like every app Omarchy launches. Elsewhere (Plasma) the default terminal
     # without uwsm, or Konsole when there is no xdg-terminal-exec.
     claude = claude_program()
-    if safe.has_tool("uwsm-app"):
+    if not plain_launch():
         return {"exec": [safe.tool("uwsm-app"), "--", safe.tool("xdg-terminal-exec"), f"--dir={cwd}", "--",
                          claude, "--resume", session]}
     if safe.has_tool("xdg-terminal-exec"):
@@ -573,7 +580,7 @@ def perform(action):
         if kind == "open-folder" and common.lstat_kind(target) != stat.S_IFDIR:
             raise common.ActionError("that folder is gone")
         # A browser or a file manager has to outlive this helper, so the panel starts it detached.
-        if not safe.has_tool("uwsm-app"):
+        if plain_launch():
             return {"exec": [safe.tool("xdg-open"), target]}
         return {"exec": [safe.tool("uwsm-app"), "--", safe.tool("xdg-open"), target]}
     if kind == "resume-agent":
@@ -590,7 +597,7 @@ def perform(action):
     # panels launch apps -- after checking that the program is this wrapper.
     words = [f"{key}={value}" for key, value in sorted(env.items())]
     words += [shlex.quote(word) for word in argv]
-    if safe.has_tool(TERMINAL):
+    if not plain_launch() and safe.has_tool(TERMINAL):
         return {"exec": [safe.tool(TERMINAL), " ".join(words)]}
     # Without Omarchy's presentation wrapper (Plasma): Konsole, kept open when the command ends so its output can
     # be read, running the same quoted command line through bash.

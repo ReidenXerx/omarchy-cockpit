@@ -195,7 +195,8 @@ PlasmaExtras.Representation {
             delegate: PlasmaComponents.ToolButton {
               required property var modelData
               required property int index
-              readonly property string key: row.it.section + "|" + row.it.title + "|" + index
+              // The action itself (it names the pid), so two rows with the same title never share a question.
+              readonly property string key: modelData.action
               readonly property bool asking: view.confirming === key
               // The provider's glyph is a Nerd Font character Plasma may not have: an icon for what it does.
               icon.name: asking ? "dialog-ok-apply" : (view.kindIcons[modelData.kind] || "go-next")

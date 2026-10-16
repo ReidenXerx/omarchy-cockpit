@@ -19,7 +19,8 @@ PlasmoidItem {
   readonly property bool agentAlerts: Plasmoid.configuration.agentAlerts !== false
 
   // What the hub is given of Plasma's environment: where home, config, data and the runtime directory are.
-  readonly property string envPrefix: "/usr/bin/env -i PATH=/usr/bin:/bin PYTHONIOENCODING=utf-8 HOME=\"$HOME\" LANG=\"$LANG\""
+  // COCKPIT_PLAIN_LAUNCH: this is Plasma, so actions open without uwsm even where uwsm is installed.
+  readonly property string envPrefix: "/usr/bin/env -i PATH=/usr/bin:/bin PYTHONIOENCODING=utf-8 COCKPIT_PLAIN_LAUNCH=1 HOME=\"$HOME\" LANG=\"$LANG\""
     + " XDG_RUNTIME_DIR=\"$XDG_RUNTIME_DIR\" XDG_CONFIG_HOME=\"$XDG_CONFIG_HOME\" XDG_DATA_HOME=\"$XDG_DATA_HOME\" "
 
   function quote(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'" }
@@ -51,16 +52,21 @@ PlasmoidItem {
   property string lastOutput: ""
   property bool refreshing: false
 
+  // A refresh asked for while one runs (after a click, say) runs right after it, so its result is not lost.
+  property bool refreshAgain: false
+
   function refresh() {
-    if (root.refreshing) return
+    if (root.refreshing) { root.refreshAgain = true; return }
     root.refreshing = true
     root.run("/usr/bin/timeout -k 2 25 " + root.helper("cockpit"), function (code, out) {
       root.refreshing = false
+      if (root.refreshAgain) { root.refreshAgain = false; Qt.callLater(root.refresh) }
       // The same document again leaves the rows alone, so the one under the pointer keeps its buttons.
       if (out === root.lastOutput) return
       var parsed = Model.parse(out)
       if (!parsed.ok) {
         root.notes = { "cockpit": "the hub produced no usable output" }
+        root.lastOutput = ""        // so the same good answer next time clears this note
         return
       }
       root.lastOutput = out
@@ -91,7 +97,10 @@ PlasmoidItem {
     root.run("/usr/bin/printf '%s\\n' " + root.quote(actionJson) + " | /usr/bin/timeout -k 2 20 " + root.helper("cockpit") + " action"
              + " # " + Date.now(), function (code, out) {
       var argv = Model.launchArgv(out.trim(), "", true)
-      if (argv) root.run("/usr/bin/setsid -f " + argv.map(root.quote).join(" ") + " >/dev/null 2>&1 # " + Date.now(), null)
+      // In a transient unit of its own: a terminal or browser started here must outlive a plasmashell restart, which
+      // would otherwise take everything left in its cgroup with it.
+      if (argv) root.run("/usr/bin/systemd-run --user --collect --quiet --slice=app.slice -- " + argv.map(root.quote).join(" ")
+                         + " >/dev/null 2>&1 # " + Date.now(), null)
       if (Model.keepsOpen(kind)) root.refreshSoon()
       else root.expanded = false
     })
