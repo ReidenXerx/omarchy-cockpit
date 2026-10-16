@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kcfg xmlns="http://www.kde.org/standards/kcfg/1.0"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.kde.org/standards/kcfg/1.0 http://www.kde.org/standards/kcfg/1.0/kcfg.xsd">
+  <kcfgfile name=""/>
+  <group name="General">
+    <entry name="rowsPerSection" type="Int">
+      <default>6</default>
+    </entry>
+    <!-- Seconds between refreshes while the panel is open. -->
+    <entry name="refreshSec" type="Int">
+      <default>3</default>
+    </entry>
+    <!-- A notification when a Claude Code session needs you or has finished a long turn. -->
+    <entry name="agentAlerts" type="Bool">
+      <default>true</default>
+    </entry>
+  </group>
+</kcfg>

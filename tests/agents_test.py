@@ -475,6 +475,14 @@ class Notifications(unittest.TestCase):
         self.settle(notifier)
         self.assertEqual([argv[0] for argv, _ in self.calls], ["timeout"])
 
+    def test_without_hyprland_a_notification_has_no_show_button_and_waits_for_nothing(self):
+        self.release.set()
+        notifier = agentd.Notifier(resolve=lambda session: "0x55aa", can_focus=False)
+        notifier.send("Claude needs you", "api: a question", {"sessionId": A})
+        self.settle(notifier)
+        self.assertEqual([argv for argv, _ in self.calls],
+                         [[safe.tool("notify-send"), "--app-name=Cockpit", "--", "Claude needs you", "api: a question"]])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

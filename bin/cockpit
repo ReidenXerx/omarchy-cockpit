@@ -540,9 +540,15 @@ def resume_agent(session, cwd):
     if not transcript_exists(session, cwd):
         raise common.ActionError("that conversation is no longer on disk")
     # A resumed chat is a working session, not a glance: your own terminal, in the project's folder, started
-    # detached through uwsm by the panel like every app Omarchy launches.
-    return {"exec": [safe.tool("uwsm-app"), "--", safe.tool("xdg-terminal-exec"), f"--dir={cwd}", "--",
-                     claude_program(), "--resume", session]}
+    # detached through uwsm by the panel like every app Omarchy launches. Elsewhere (Plasma) the default terminal
+    # without uwsm, or Konsole when there is no xdg-terminal-exec.
+    claude = claude_program()
+    if safe.has_tool("uwsm-app"):
+        return {"exec": [safe.tool("uwsm-app"), "--", safe.tool("xdg-terminal-exec"), f"--dir={cwd}", "--",
+                         claude, "--resume", session]}
+    if safe.has_tool("xdg-terminal-exec"):
+        return {"exec": [safe.tool("xdg-terminal-exec"), f"--dir={cwd}", "--", claude, "--resume", session]}
+    return {"exec": [safe.tool("konsole"), "--workdir", cwd, "-e", claude, "--resume", session]}
 
 
 def perform(action):
@@ -567,6 +573,8 @@ def perform(action):
         if kind == "open-folder" and common.lstat_kind(target) != stat.S_IFDIR:
             raise common.ActionError("that folder is gone")
         # A browser or a file manager has to outlive this helper, so the panel starts it detached.
+        if not safe.has_tool("uwsm-app"):
+            return {"exec": [safe.tool("xdg-open"), target]}
         return {"exec": [safe.tool("uwsm-app"), "--", safe.tool("xdg-open"), target]}
     if kind == "resume-agent":
         return resume_agent(action["session"], action["cwd"])
@@ -582,7 +590,11 @@ def perform(action):
     # panels launch apps -- after checking that the program is this wrapper.
     words = [f"{key}={value}" for key, value in sorted(env.items())]
     words += [shlex.quote(word) for word in argv]
-    return {"exec": [safe.tool(TERMINAL), " ".join(words)]}
+    if safe.has_tool(TERMINAL):
+        return {"exec": [safe.tool(TERMINAL), " ".join(words)]}
+    # Without Omarchy's presentation wrapper (Plasma): Konsole, kept open when the command ends so its output can
+    # be read, running the same quoted command line through bash.
+    return {"exec": [safe.tool("konsole"), "--hold", "-e", "/usr/bin/bash", "-c", " ".join(words)]}
 
 
 def tell(message):

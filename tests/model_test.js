@@ -173,4 +173,28 @@ test("launchArgv accepts a local address or a folder for xdg-open, and a resumed
   }
 })
 
+test("launchArgv takes the Plasma shapes only when asked, and only exactly", () => {
+  const ex = (a) => JSON.stringify({ exec: a })
+  const claude = "/home/me/.local/bin/claude"
+  const good = [
+    ["/usr/bin/xdg-open", "/home/me/src/api"],
+    ["/usr/bin/xdg-open", "http://127.0.0.1:5173/"],
+    ["/usr/bin/xdg-terminal-exec", "--dir=/home/me/src/api", "--", claude, "--resume", SESSION],
+    ["/usr/bin/konsole", "--workdir", "/home/me/src/api", "-e", claude, "--resume", SESSION],
+    ["/usr/bin/konsole", "--hold", "-e", "/usr/bin/bash", "-c", "/usr/bin/checkupdates"],
+  ]
+  for (const a of good) {
+    assert.deepStrictEqual(M.launchArgv(ex(a), LAUNCHER, true), a, a.join(" "))
+    assert.strictEqual(M.launchArgv(ex(a), LAUNCHER), null, "not on Omarchy: " + a[0])
+  }
+  for (const a of [
+    ["/usr/bin/xdg-open", "https://example.org/"], ["/usr/bin/xdg-open", "/home/me/../etc"],
+    ["/usr/bin/konsole", "--workdir", "/home/me", "-e", "/usr/bin/bash", "--resume", SESSION],
+    ["/usr/bin/konsole", "--workdir", "/home/me", "-e", claude, "--resume", SESSION, "--x"],
+    ["/usr/bin/konsole", "-e", "/usr/bin/bash", "-c", "rm -rf ~"],
+    ["/usr/bin/konsole", "--hold", "-e", "/usr/bin/sh", "-c", "x"],
+    ["/usr/bin/xdg-terminal-exec", "--dir=relative", "--", claude, "--resume", SESSION],
+  ]) assert.strictEqual(M.launchArgv(ex(a), LAUNCHER, true), null, a.join(" "))
+})
+
 process.exit(failures ? 1 : 0)

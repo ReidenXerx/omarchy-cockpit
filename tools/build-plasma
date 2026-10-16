@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Assemble the Plasma widget: the plasma/ package plus the shared core (the hub, its providers, the agents daemon
+# and CockpitModel.js), into dist/app.duduphudu.cockpit and dist/cockpit.plasmoid.
+set -euo pipefail
+root="$(cd "$(dirname "$0")/.." && pwd)"
+out="$root/dist/app.duduphudu.cockpit"
+rm -rf -- "${out:?}" "$root/dist/cockpit.plasmoid"
+mkdir -p "$out/contents/code/bin" "$out/contents/code/providers"
+cp -r "$root/plasma/." "$out/"
+cp "$root/bin/cockpit" "$root/bin/cockpit-agentd" "$root"/bin/*.py "$out/contents/code/bin/"
+cp "$root"/providers/* "$out/contents/code/providers/"
+cp "$root/CockpitModel.js" "$out/contents/code/"
+cp "$root/LICENSE" "$out/" 2>/dev/null || true
+chmod 755 "$out/contents/code/bin/cockpit" "$out/contents/code/bin/cockpit-agentd"
+(cd "$out" && /usr/bin/zip -qr "$root/dist/cockpit.plasmoid" .)
+echo "$out"

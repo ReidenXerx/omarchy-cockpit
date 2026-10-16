@@ -178,6 +178,9 @@ def marker(branch, ahead, behind, entries, partial, newest):
 
 
 def ago(seconds):
+    # A file written a moment ago can be a second ahead of the clock that measures it; floor division would
+    # make that "-1h ago".
+    seconds = max(0, seconds)
     days = seconds / 86400
     if days < 1:
         hours = int(seconds // 3600)

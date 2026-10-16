@@ -315,6 +315,17 @@ class NewActions(Sandbox):
         transcript.rename(elsewhere / transcript.name)
         self.assertEqual(self.resume(cwd)["exec"][-1], SESSION, "found in another project folder")
 
+    def test_without_omarchy_a_chat_resumes_in_the_default_terminal_or_konsole(self):
+        claude, cwd, _ = self.resume_fixture()
+        tools = {"xdg-terminal-exec": "/usr/bin/xdg-terminal-exec", "konsole": "/usr/bin/konsole"}
+        with mock.patch.object(safe, "has_tool", lambda name: name in tools), \
+             mock.patch.object(safe, "tool", lambda name: tools[name]):
+            self.assertEqual(self.resume(cwd), {"exec": [
+                "/usr/bin/xdg-terminal-exec", f"--dir={cwd}", "--", str(claude), "--resume", SESSION]})
+            del tools["xdg-terminal-exec"]
+            self.assertEqual(self.resume(cwd), {"exec": [
+                "/usr/bin/konsole", "--workdir", str(cwd), "-e", str(claude), "--resume", SESSION]})
+
     def test_resuming_refuses_a_missing_chat_folder_or_an_untrusted_claude(self):
         claude, cwd, transcript = self.resume_fixture()
         transcript.unlink()

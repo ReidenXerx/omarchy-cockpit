@@ -249,9 +249,11 @@ class Notifier:
     """Notifications that wait for their Show button in threads of their own, so the event loop
     never waits. At most NOTIFY_MAX wait at once; more are dropped rather than queued."""
 
-    def __init__(self, enabled=True, resolve=None):
+    def __init__(self, enabled=True, resolve=None, can_focus=True):
         self.enabled = enabled
         self.resolve = resolve or window_of
+        # Without Hyprland (Plasma) there is no window to bring forward: a plain notification, no Show button.
+        self.can_focus = can_focus
         self.lock = threading.Lock()
         self.waiting = 0
 
@@ -267,6 +269,9 @@ class Notifier:
 
     def _deliver(self, title, body, session):
         try:
+            if not self.can_focus:
+                safe.run([safe.tool("notify-send"), "--app-name=Cockpit", "--", title, body], timeout=10, max_output=1024)
+                return
             # Under /usr/bin/timeout as well as safe.run's deadline: a notification still waiting
             # when the daemon exits must not wait for ever.
             r = safe.run(["timeout", "--kill-after=2", str(NOTIFY_WAIT), safe.tool("notify-send"),
@@ -506,6 +511,27 @@ def watch(path, alerts=True):
     return 0
 
 
+def watch_sessions(alerts=True):
+    """Where there is no Hyprland (the Plasma edition): only the sessions -- their history and their alerts --
+    read every POLL_EVERY seconds. What each is doing comes from window titles, so it is not known here."""
+    tracker = Tracker({})
+    sessions = SessionWatch(tracker, Notifier(enabled=alerts, can_focus=False), agents.load_history(), time.time(),
+                            map_windows=lambda found: None)
+    try:
+        while True:
+            now = time.time()
+            if sessions.due(now):
+                try:
+                    sessions.poll(now)
+                except Exception as e:  # noqa: BLE001 - a bad reading must not end the watch
+                    print(f"cockpit-agentd: reading sessions failed: {common.clean_text(str(e), 200)}",
+                          file=sys.stderr)
+            time.sleep(POLL_EVERY)
+    finally:
+        if sessions.pending or sessions.titles_pending:
+            sessions.write(time.time())
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if any(arg != "--no-alerts" for arg in argv):
@@ -525,8 +551,10 @@ def main(argv=None):
     try:
         path = socket_path()
         if not path:
-            print("cockpit-agentd: no Hyprland event socket", file=sys.stderr)
-            return 1
+            if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+                print("cockpit-agentd: no Hyprland event socket", file=sys.stderr)
+                return 1
+            return watch_sessions(alerts="--no-alerts" not in argv)
         return watch(path, alerts="--no-alerts" not in argv)
     except (OSError, safe.UnsafeError) as e:
         print(f"cockpit-agentd: {e}", file=sys.stderr)

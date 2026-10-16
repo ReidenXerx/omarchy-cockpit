@@ -1,0 +1,17 @@
+{
+  "KPackageStructure": "Plasma/Applet",
+  "KPlugin": {
+    "Authors": [{ "Name": "DuduPhudu", "Email": "" }],
+    "Category": "System Information",
+    "Description": "One place for what the computer is doing right now: AI sessions and the chats you can resume, transfers, long jobs, repos with unpushed work, ports, updates, the network, devices and disks.",
+    "Icon": "dashboard-show",
+    "Id": "app.duduphudu.cockpit",
+    "License": "MIT",
+    "Name": "Cockpit",
+    "Version": "1.3.1",
+    "Website": "https://duduphudu.app/plugins/cockpit/"
+  },
+  "X-Plasma-API-Minimum-Version": "6.0",
+  "X-Plasma-NotificationArea": "true",
+  "X-Plasma-NotificationAreaCategory": "SystemServices"
+}

@@ -17,6 +17,7 @@ var DISMISSED_MAX = 9999
 var UWSM_APP = "/usr/bin/uwsm-app"
 var XDG_OPEN = "/usr/bin/xdg-open"
 var TERMINAL_EXEC = "/usr/bin/xdg-terminal-exec"
+var KONSOLE = "/usr/bin/konsole"
 var PROVIDER_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
 var SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 var LOCAL_URL = /^http:\/\/(127\.0\.0\.1|localhost|\[::1\]):[1-9][0-9]{0,4}(\/[A-Za-z0-9._~\/-]*)?$/
@@ -189,7 +190,7 @@ function plainPath(value) {
 //   the presentation terminal with one command line                            (terminal)
 //   uwsm-app -- xdg-open <a local address or a folder>                         (open-url, open-folder)
 //   uwsm-app -- xdg-terminal-exec --dir=<folder> -- <claude> --resume <session>  (resume-agent)
-function launchArgv(raw, launcher) {
+function launchArgv(raw, launcher, plasma) {
   if (typeof raw !== "string" || raw.length === 0 || raw.length > LAUNCH_MAX) return null
   var doc = null
   try { doc = JSON.parse(raw) } catch (e) { return null }
@@ -204,6 +205,26 @@ function launchArgv(raw, launcher) {
   if (a.length === 8 && a[0] === UWSM_APP && a[1] === "--" && a[2] === TERMINAL_EXEC && a[3].indexOf("--dir=") === 0
       && plainPath(a[3].slice(6)) && a[4] === "--" && plainPath(a[5]) && /\/claude$/.test(a[5])
       && a[6] === "--resume" && SESSION_ID.test(a[7]))
+    return a.slice()
+  return plasma ? plasmaArgv(a) : null
+}
+
+// The same launches where there is no uwsm and no presentation wrapper (the Plasma edition):
+//   xdg-open <a local address or a folder>
+//   xdg-terminal-exec --dir=<folder> -- <claude> --resume <session>
+//   konsole --workdir <folder> -e <claude> --resume <session>
+//   konsole --hold -e /usr/bin/bash -c <one command line>                    (terminal)
+function plasmaArgv(a) {
+  var resumes = function (claude, flag, session) {
+    return plainPath(claude) && /\/claude$/.test(claude) && flag === "--resume" && SESSION_ID.test(session)
+  }
+  if (a.length === 2 && a[0] === XDG_OPEN && (LOCAL_URL.test(a[1]) || plainPath(a[1]))) return a.slice()
+  if (a.length === 6 && a[0] === TERMINAL_EXEC && a[1].indexOf("--dir=") === 0 && plainPath(a[1].slice(6))
+      && a[2] === "--" && resumes(a[3], a[4], a[5]))
+    return a.slice()
+  if (a.length === 7 && a[0] === KONSOLE && a[1] === "--workdir" && plainPath(a[2]) && a[3] === "-e" && resumes(a[4], a[5], a[6]))
+    return a.slice()
+  if (a.length === 6 && a[0] === KONSOLE && a[1] === "--hold" && a[2] === "-e" && a[3] === "/usr/bin/bash" && a[4] === "-c")
     return a.slice()
   return null
 }

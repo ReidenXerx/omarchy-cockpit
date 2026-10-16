@@ -108,6 +108,31 @@ A title spinner goes quiet during a long tool call and cannot show a question, s
 rows say **working** or **last active 4m**, never "idle" or "needs you": the label does not
 claim more than the title can tell.
 
+## On KDE Plasma
+
+Cockpit also comes as a Plasma 6 widget, for the panel or the system tray, with
+the same hub and providers underneath, so your own providers work there too.
+Install it from the KDE Store (Add Widgets → Get New Widgets → search
+"Cockpit"), or build it here:
+
+```bash
+tools/build-plasma          # dist/cockpit.plasmoid
+kpackagetool6 -t Plasma/Applet -i dist/app.duduphudu.cockpit
+```
+
+What differs, because Plasma is not Hyprland:
+
+- **Agents** come from Claude Code's own session records: which sessions are
+  running, the chats you can resume, and a notification when one needs you or
+  has finished a long turn. What each one is doing right now is read from its
+  window title on Hyprland, so on Plasma it is not shown, and a notification has
+  no Show button.
+- A resumed chat opens in your default terminal (`xdg-terminal-exec`), or in
+  Konsole; a terminal action opens in Konsole and stays open when it ends; links
+  and folders open with `xdg-open`.
+- Row buttons are icons for what they do, with the provider's label as the
+  tooltip, since Plasma may not have the Nerd Font the glyphs use.
+
 ## Write your own provider
 
 Drop an executable in `~/.config/omarchy/cockpit/providers/`. It prints one JSON object and
